@@ -4,6 +4,5 @@ numpy
 matplotlib
 scikit-learn
 joblib
-tensorflow
-keras
-tf-keras
+keras==2.15.0
+h5py

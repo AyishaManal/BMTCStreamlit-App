@@ -1,10 +1,12 @@
 # BMTC Bus Delay Predictor — Bengaluru
-
+import os
 import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import joblib
+os.environ['KERAS_BACKEND'] = 'numpy'
+import keras
 from keras.models import load_model
 from difflib import get_close_matches
 import warnings
@@ -21,7 +23,7 @@ st.set_page_config(
 @st.cache_resource
 def load_model_and_data():
     scaler       = joblib.load('models/scaler.pkl')
-    model = load_model('models/lstm_model.h5', compile=False)
+    model = keras.models.load_model('models/lstm_model.h5', compile=False)
     stop_summary = pd.read_csv('models/stop_summary.csv')
     final_results= pd.read_csv('outputs/final_results.csv')
     return scaler, model, stop_summary, final_results
