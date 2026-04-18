@@ -4,5 +4,5 @@ numpy
 matplotlib
 scikit-learn
 joblib
-keras==2.15.0
+keras==3.9.0
 h5py
