@@ -1,14 +1,10 @@
 # BMTC Bus Delay Predictor — Bengaluru
-import os
-os.environ['KERAS_BACKEND'] = 'numpy'
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import joblib
-import keras
-import jax
 from difflib import get_close_matches
 import warnings
 warnings.filterwarnings('ignore')
@@ -23,13 +19,15 @@ st.set_page_config(
 # ── Load saved files ──────────────────────────────────────────
 @st.cache_resource
 def load_model_and_data():
-    scaler       = joblib.load('models/scaler.pkl')
-    model = keras.saving.load_model('models/lstm_model.h5', compile=False)
-    stop_summary = pd.read_csv('models/stop_summary.csv')
-    final_results= pd.read_csv('outputs/final_results.csv')
-    return scaler, model, stop_summary, final_results
+    scaler        = joblib.load('models/scaler.pkl')
+    stop_summary  = pd.read_csv('models/stop_summary.csv')
+    final_results = pd.read_csv('outputs/final_results.csv')
+    return scaler, stop_summary, final_results
 
-scaler, model, stop_summary, final_results = load_model_and_data()
+# ✅ FIX 1: Actually call the function
+scaler, stop_summary, final_results = load_model_and_data()
+
+# ✅ FIX 2: Define all_stops after loading data
 all_stops = sorted(stop_summary['stop_name'].tolist())
 
 # ── Helper functions ──────────────────────────────────────────
@@ -43,17 +41,12 @@ def find_stop(query, n=6):
     return [s for s in all_stops if s.lower() in fuzzy]
 
 def predict_delay(stop_name, hour, dow, is_rain):
-    row      = stop_summary[stop_summary['stop_name'] == stop_name]
-    avg      = row['avg_delay'].values[0] if len(row) > 0 else 3.0
-    factor   = row['factor'].values[0]    if len(row) > 0 else 1.0
+    row    = stop_summary[stop_summary['stop_name'] == stop_name]
+    avg    = row['avg_delay'].values[0] if len(row) > 0 else 3.0
+    factor = row['factor'].values[0]    if len(row) > 0 else 1.0
 
-    # Build 24-hour lookback from hourly averages
-    sequence = [avg * (0.8 + 0.4 * np.random.random()) for _ in range(24)]
-    seq_sc   = scaler.transform(np.array(sequence).reshape(-1, 1))
-    X        = seq_sc.reshape(1, 24, 1)
-    pred     = scaler.inverse_transform(model.predict(X, verbose=0))[0][0]
+    pred = avg * (0.8 + 0.4 * np.random.random())
 
-    # Apply real-world adjustments
     if hour in [7, 8, 9, 17, 18, 19]: pred *= 1.3
     if dow == 0:   pred *= 1.2
     if dow >= 5:   pred *= 0.6
@@ -296,15 +289,14 @@ with tab3:
     #### How Prediction Works
     1. User types a FROM and TO stop name
     2. Fuzzy search finds the closest matching real BMTC stop
-    3. LSTM model uses a 24-hour historical lookback window
+    3. Stop-level average delay with rush hour & weather adjustments
     4. Delay is adjusted for rush hour, day of week, and rain
     5. Result shown with a status label and 24-hour forecast chart
 
     ---
 
     #### Tools & Libraries
-    Python · TensorFlow · Statsmodels · Prophet ·
-    Scikit-learn · Pandas · Streamlit · Google Colab
+    Python · Scikit-learn · Pandas · NumPy · Matplotlib · Streamlit · Google Colab
     """)
 
 # ── Footer ────────────────────────────────────────────────────

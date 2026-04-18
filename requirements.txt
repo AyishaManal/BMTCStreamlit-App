@@ -4,5 +4,3 @@ numpy
 matplotlib
 scikit-learn
 joblib
-keras==3.9.0
-h5py
