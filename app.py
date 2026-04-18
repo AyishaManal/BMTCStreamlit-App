@@ -19,9 +19,9 @@ st.set_page_config(
 # ── Load saved files ──────────────────────────────────────────
 @st.cache_resource
 def load_model_and_data():
-    scaler        = joblib.load('models/scaler.pkl')
-    stop_summary  = pd.read_csv('models/stop_summary.csv')
-    final_results = pd.read_csv('outputs/final_results.csv')
+    scaler        = joblib.load('models/models/scaler.pkl')
+    stop_summary  = pd.read_csv('models/models/stop_summary.csv')
+    final_results = pd.read_csv('outputs/outputs/final_results.csv')
     return scaler, stop_summary, final_results
 
 # ✅ FIX 1: Actually call the function
@@ -241,27 +241,24 @@ with tab2:
     # Show saved output images
     st.markdown("#### Actual vs Predicted — Statistical Models")
     try:
-        st.image('outputs/statistical_models.png',
-                 use_container_width=True)
+        st.image('outputs/outputs/statistical_models.png', use_container_width=True)
     except:
         st.info("Run Notebook 2 first to generate this plot.")
 
     st.markdown("#### LSTM — Training Curves")
     try:
-        st.image('outputs/lstm_training.png',
-                 use_container_width=True)
+        st.image('outputs/outputs/lstm_training.png', use_container_width=True)
     except:
         st.info("Run Notebook 3 first to generate this plot.")
 
     st.markdown("#### LSTM — Actual vs Predicted")
     try:
-        st.image('outputs/lstm_predictions.png',
-                 use_container_width=True)
+        st.image('outputs/outputs/lstm_predictions.png', use_container_width=True)
     except:
         st.info("Run Notebook 3 first to generate this plot.")
 
 # ══════════════════════════════════════════════════════════════
-# TAB 3 — ABOUT
+# TAB 3 — ABOUTs
 # ══════════════════════════════════════════════════════════════
 with tab3:
     st.subheader("About This Project")
