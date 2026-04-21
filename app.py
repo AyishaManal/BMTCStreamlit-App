@@ -128,7 +128,7 @@ def predict_delay(stop_name, hour, dow, month, is_rain):
     X, _ = build_features(stop_name, hour, dow, month, is_rain)
     if X is None:
         return 0.0
-    return float(np.clip(xgb_model.predict(X)[0], 0, None))
+    return round(float(np.clip(xgb_model.predict(X)[0], 0, None)), 1)
 
 def get_status(delay):
     if delay < 3:  return "✅ On Time",      "#065F46", "#D1FAE5"
@@ -264,7 +264,7 @@ with tab1:
                         m = load_prophet_model(stop_name)
                         if m:
                             future = pd.DataFrame({
-                                "ds"     : pd.date_range("2024-07-01", periods=24, freq="H"),
+                                "ds"     : pd.date_range("2024-07-01", periods=24, freq="h"),
                                 "is_rush": [1 if h in [7,8,9,17,18,19] else 0
                                             for h in range(24)]
                             })
