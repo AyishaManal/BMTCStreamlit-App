@@ -1,0 +1,6 @@
+Model,Scope,RMSE,MAE,R2,Used for
+XGBoost — all stops (primary),"All 1,955 stops",3.488,2.05,0.797,Live prediction — Streamlit app
+LSTM (Bi-directional),Yeshawanthapura Tollgate only,6.998,4.988,0.161,Deep learning comparison
+"ARIMA (2, 0, 1)",Kempegowda Bus Station only,27.595,18.136,—,Statistical time-series comparison
+"SARIMA (2, 0, 1)(1,1,1,24)",Kempegowda Bus Station only,23.852,14.608,—,Statistical time-series comparison
+Prophet (avg over 30 stops),Top 30 high-delay stops,11.084,7.045,—,24-hr forecast chart in Streamlit

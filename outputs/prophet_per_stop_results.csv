@@ -1,0 +1,31 @@
+stop,model,rmse,mae
+Kempegowda Bus Station,Prophet,23.463,14.762
+Corporation,Prophet,14.944,9.857
+Town Hall,Prophet,11.776,8.064
+KR Market,Prophet,10.8,7.244
+Maharani College,Prophet,12.895,7.251
+Indian Express,Prophet,10.955,7.685
+Shivajinagara Bus Station,Prophet,12.032,7.458
+Yeshawanthapura Bus Station,Prophet,11.258,6.675
+Hebbala,Prophet,10.363,6.64
+Military Dairy Farm (Esteem Mall),Prophet,10.018,6.846
+Tin Factory,Prophet,11.137,7.473
+Jalahalli Cross,Prophet,10.34,7.136
+Banashankari Bus Station,Prophet,10.824,6.139
+Kogilu Cross,Prophet,10.145,6.432
+Mekhri Circle,Prophet,11.556,6.552
+Mysore Bank,Prophet,10.231,6.137
+KR Market (Kalasipalya),Prophet,9.858,6.386
+Yelahanka Santhe Circle,Prophet,10.311,6.76
+Byatarayanapura,Prophet,10.827,6.186
+Central,Prophet,10.11,6.508
+Hebbala Bridge,Prophet,9.677,6.353
+Malleshwara Circle,Prophet,11.086,6.729
+BHEL,Prophet,8.755,5.761
+Allalasandra Gate,Prophet,10.261,6.582
+Central Silk Board,Prophet,10.207,6.62
+Bengaluru Dairy Circle,Prophet,10.01,6.318
+RM Guttahalli,Prophet,10.279,7.249
+Nimhans Hospital,Prophet,9.86,5.854
+8th Mile Dasarahalli,Prophet,9.481,6.053
+KR Circle,Prophet,9.055,5.633

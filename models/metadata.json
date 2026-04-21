@@ -1,0 +1,61 @@
+{
+  "features": [
+    "factor",
+    "trip_count",
+    "route_count",
+    "hour",
+    "day_of_week",
+    "month",
+    "is_weekend",
+    "is_rush",
+    "is_rain",
+    "hour_sin",
+    "hour_cos",
+    "dow_sin",
+    "dow_cos",
+    "lag_1h",
+    "lag_24h",
+    "roll_3h",
+    "roll_6h",
+    "roll_24h"
+  ],
+  "target": "delay_minutes",
+  "primary_model": "xgb_model.pkl",
+  "lstm_stop": "Yeshawanthapura Tollgate",
+  "stop_summary_file": "stop_summary.csv",
+  "train_date_end": "2024-05-25",
+  "n_stops": 1955,
+  "best_xgb_round": 668,
+  "metrics": {
+    "xgb": {
+      "rmse": 3.488,
+      "mae": 2.05,
+      "r2": 0.797
+    },
+    "lstm": {
+      "rmse": 6.998,
+      "mae": 4.988,
+      "r2": 0.161
+    },
+    "arima": {
+      "rmse": 27.595,
+      "mae": 18.136,
+      "scope": "Kempegowda Bus Station only",
+      "order": "(2, 0, 1)"
+    },
+    "sarima": {
+      "rmse": 23.852,
+      "mae": 14.608,
+      "scope": "Kempegowda Bus Station only",
+      "order": "(2, 0, 1)(1,1,1,24)"
+    },
+    "prophet": {
+      "rmse": 11.084,
+      "mae": 7.045,
+      "scope": "Top 30 high-delay stops",
+      "n_stops": 30
+    }
+  },
+  "prophet_stops_file": "prophet_stops.json",
+  "prophet_model_dir": "prophet/"
+}
