@@ -132,7 +132,7 @@ def predict_delay(stop_name, hour, dow, month, is_rain):
 
 def get_status(delay):
     if delay < 3:  return "✅ On Time",      "#065F46", "#D1FAE5"
-    if delay < 7:  return "⚠️ Minor Delay",  "#92400E", "#FEF3C7"
+    if delay < 8:  return "⚠️ Minor Delay",  "#92400E", "#FEF3C7"
     return               "🔴 Major Delay",   "#991B1B", "#FEE2E2"
 
 # ── Header ────────────────────────────────────────────────────────────────────
@@ -140,7 +140,7 @@ st.markdown("""
     <h1 style='color:#1A3A5C; margin-bottom:0'>🚌 BMTC Delay Predictor</h1>
     <p style='color:gray; margin-top:4px'>
         Bengaluru · ML-Powered Bus Delay Forecasting ·
-        BCA Final Year Internship Project
+        
     </p>
     <hr>
 """, unsafe_allow_html=True)
@@ -241,7 +241,7 @@ with tab1:
 
             # ── Travel tip ────────────────────────────────────────────────────
             st.markdown("<br>", unsafe_allow_html=True)
-            if worse >= 7:
+            if worse >= 8:
                 st.error("💡 Leave early — heavy delays expected on this route!")
             elif worse >= 3:
                 st.warning("💡 Keep a 10-minute buffer for this journey.")
@@ -408,7 +408,7 @@ with tab3:
 
     ---
 
-    #### Model Architecture (Option C — Hybrid)
+    #### Model Architecture (Hybrid)
 
     | Model | Type | Scope | Purpose |
     |---|---|---|---|
@@ -437,24 +437,13 @@ with tab3:
     #### Tools & Libraries
     Python · XGBoost · Prophet · Scikit-learn · TensorFlow/Keras ·
     Pandas · NumPy · Matplotlib · Streamlit · Google Colab
-
-    ---
-
-    #### Bugs Fixed vs Original Code
-    | Issue | Original | Fixed |
-    |---|---|---|
-    | Geometry regex | lon = NaN for all stops | Both lon/lat extracted correctly |
-    | Stop filter | Top 150 only | All stops with ≥50 trips (~1,955) |
-    | Model scope | LSTM on 1 stop | XGBoost on all stops simultaneously |
-    | Prediction logic | Random noise formula | Real XGBoost model inference |
-    | File paths | Doubled paths (models/models/) | Correct single-level paths |
     """)
 
 # ── Footer ────────────────────────────────────────────────────────────────────
 st.markdown("""
     <hr>
     <p style='text-align:center;color:gray;font-size:0.8em'>
-    BCA Final Year · Machine Learning Internship ·
+    Machine Learning Model ·
     BMTC Delay Prediction · Bengaluru
     </p>
 """, unsafe_allow_html=True)
