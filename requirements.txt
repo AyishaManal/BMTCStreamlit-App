@@ -1,4 +1,5 @@
 streamlit
+pytz
 pandas
 numpy
 matplotlib
