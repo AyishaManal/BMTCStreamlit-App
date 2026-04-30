@@ -31,7 +31,7 @@ OUTPUT_DIR = "outputs"
 # Get a free key at https://openweathermap.org/api (Free tier: 60 calls/min)
 # Add it to Streamlit Cloud: Settings → Secrets → paste below
 # [openweather]
-api_key = "14dd0de250b45fae2cba4e198e6b845f"
+
 try:
     OWM_API_KEY = st.secrets["openweather"]["api_key"]
 except (KeyError, FileNotFoundError):
@@ -166,32 +166,81 @@ def find_stop(query, n=6):
     fuzzy = get_close_matches(query, [s.lower() for s in all_stops],
                               n=n, cutoff=0.4)
     return [s for s in all_stops if s.lower() in fuzzy]
-
+ 
 def find_buses(src, dst):
+    """
+    Find bus numbers connecting src and dst stops.
+ 
+    Strategy:
+      - Extract the core AREA keyword from each stop name by stripping common
+        suffixes (Police Station, Bus Station, Gate, etc.) that appear in
+        stop_summary but NOT in routes.csv full_names.
+      - Score each route by how many area keywords it contains from each side.
+      - Confidence 3 → both src AND dst area found in route name (best match).
+      - Confidence 2 → only src area found (buses serving the FROM area).
+      - Confidence 1 → only dst area found (buses serving the TO area, fallback).
+      - Deduplicate by bus number (same route appears in both directions).
+      - Return top-5 by (confidence DESC, trip_count DESC).
+    """
     if routes_df.empty:
         return []
-    def keywords(stop_name):
-        skip = {"bus","station","stop","road","gate","circle",
-                "nagar","layout","cross","main","bridge","town"}
-        words = stop_name.lower().split()
-        keys  = [w for w in words if len(w) > 3 and w not in skip]
-        return keys[:2] if keys else [stop_name.lower()[:6]]
-    src_keys = keywords(src)
-    dst_keys = keywords(dst)
-    matched  = []
+ 
+    def area_keywords(stop_name):
+        """Strip common stop-type suffixes to get the bare area/locality name."""
+        suffixes = [
+            "police station", "bus station", "bus stand", "bus stop",
+            "railway station", "metro station", "metro", "circle", "gate",
+            "junction", "flyover", "bridge", "hospital", "school", "college",
+            "depot", "terminal",
+        ]
+        name = stop_name.lower()
+        for s in suffixes:
+            name = name.replace(s, "").strip()
+        skip = {
+            "bus", "stop", "the", "and", "for", "near", "road", "main",
+            "cross", "layout", "nagar", "stage", "old", "new", "town", "cs-",
+        }
+        words = name.replace("-", " ").split()
+        keys = [w for w in words if len(w) > 2 and w not in skip]
+        return keys
+ 
+    src_keys = area_keywords(src)
+    dst_keys = area_keywords(dst)
+ 
+    # Score every route; keep best (confidence, trip_count) per bus number
+    bus_best = {}   # bus_number → (confidence, trip_count, full_name)
     for _, row in routes_df.iterrows():
-        text      = row["full_name_lower"]
-        src_found = any(k in text for k in src_keys)
-        dst_found = any(k in text for k in dst_keys)
-        if src_found and dst_found:
-            matched.append((row["bus_number"], row["trip_count"]))
-    if not matched:
-        for _, row in routes_df.iterrows():
-            if any(k in row["full_name_lower"] for k in dst_keys):
-                matched.append((row["bus_number"], row["trip_count"]))
-    matched_sorted = sorted(matched, key=lambda x: x[1], reverse=True)
-    return [bus for bus, _ in matched_sorted[:5]]
-
+        text = row["full_name_lower"]
+        src_score = sum(1 for k in src_keys if k in text)
+        dst_score = sum(1 for k in dst_keys if k in text)
+ 
+        if src_score >= 1 and dst_score >= 1:
+            confidence = 3
+        elif src_score >= 1:
+            confidence = 2
+        elif dst_score >= 1:
+            confidence = 1
+        else:
+            continue
+ 
+        bus = row["bus_number"]
+        tc  = row["trip_count"]
+        if bus not in bus_best or (confidence, tc) > (bus_best[bus][0], bus_best[bus][1]):
+            bus_best[bus] = (confidence, tc, row["full_name"])
+ 
+    if not bus_best:
+        return []
+ 
+    sorted_buses = sorted(
+        bus_best.items(),
+        key=lambda x: (x[1][0], x[1][1]),   # sort by confidence then trip_count
+        reverse=True,
+    )
+ 
+    # Prefer confidence-3 routes; if none, return confidence-2 with a note
+    top = sorted_buses[:5]
+    return [(bus, conf, fn) for bus, (conf, tc, fn) in top]
+ 
 def build_features(stop_name, hour, dow, month, is_rain):
     row = stop_summary[stop_summary["stop_name"] == stop_name]
     if row.empty:
@@ -226,13 +275,13 @@ def build_features(stop_name, hour, dow, month, is_rain):
     }
     X = pd.DataFrame([input_dict])[FEATURES]
     return X, s
-
+ 
 def predict_delay(stop_name, hour, dow, month, is_rain):
     X, _ = build_features(stop_name, hour, dow, month, is_rain)
     if X is None:
         return 0.0
     return round(float(np.clip(xgb_model.predict(X)[0], 0, None)), 1)
-
+ 
 def get_status(delay):
     if delay < 3:  return "✅ On Time",      "#065F46", "#D1FAE5"
     if delay < 8:  return "⚠️ Minor Delay",  "#92400E", "#FEF3C7"
