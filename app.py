@@ -31,8 +31,11 @@ OUTPUT_DIR = "outputs"
 # Get a free key at https://openweathermap.org/api (Free tier: 60 calls/min)
 # Add it to Streamlit Cloud: Settings → Secrets → paste below
 # [openweather]
-# api_key = "your_key_here"
-OWM_API_KEY = st.secrets.get("openweather", {}).get("api_key", "")
+api_key = "14dd0de250b45fae2cba4e198e6b845f"
+try:
+    OWM_API_KEY = st.secrets["openweather"]["api_key"]
+except (KeyError, FileNotFoundError):
+    OWM_API_KEY = ""
 
 # ── Live weather fetch ────────────────────────────────────────────────────────
 @st.cache_data(ttl=600)   # refresh every 10 minutes
