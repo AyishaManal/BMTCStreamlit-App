@@ -562,67 +562,19 @@ with tab1:
             source = bus_result["source"]
             note   = bus_result["note"]
 
-            # ── Sanitise note: convert any markdown links → plain <a> tags ─────
-            # find_buses may return notes like "[text](url)" – invalid inside HTML
-            def _md_link_to_html(text: str) -> str:
-                import re as _re
-                return _re.sub(
-                    r"\[([^\]]+)\]\((https?://[^\)]+)\)",
-                    r'<a href="\2" target="_blank" style="color:#3B82F6">\1</a>',
-                    text
-                )
-            note = _md_link_to_html(note)
+            # ── Sanitise note: strip any markdown link syntax ─────────────────
+            note = re.sub(
+                r"\[([^\]]+)\]\((https?://[^\)]+)\)",
+                r"\1 (\2)",
+                note
+            )
 
-            # ── Build bus-number HTML for the unified card ────────────────────
-            source_dot = {
-                "live"  : ("#22C55E", "🟢 Live data"),
-                "gtfs"  : ("#EAB308", "🟡 GTFS offline"),
-                "static": ("#F97316", "🟠 Estimated"),
-                "none"  : ("#9CA3AF", "⚪ Not found"),
-            }.get(source, ("#9CA3AF", ""))
-            dot_color, dot_label = source_dot
-
-            if buses:
-                bus_pills_html = "".join(
-                    f"<span style='"
-                    f"display:inline-block;background:#1E3A5F;color:#E0F2FE;"
-                    f"border-radius:6px;padding:4px 10px;margin:3px 4px 3px 0;"
-                    f"font-weight:700;font-size:0.95rem;letter-spacing:0.03em"
-                    f"'>{b}</span>"
-                    for b in buses
-                )
-                bus_section_html = f"""
-                <div style='margin-top:14px;padding-top:14px;
-                            border-top:1px solid rgba(0,0,0,0.08)'>
-                    <p style='margin:0 0 6px 0;font-weight:600;color:#1A3A5C;font-size:0.9rem'>
-                        🚌 Buses on this corridor
-                    </p>
-                    <div>{bus_pills_html}</div>
-                    <p style='margin:6px 0 0 0;font-size:0.75rem;color:{dot_color}'>
-                        {dot_label} · {note}
-                    </p>
-                </div>
-                """
-            else:
-                bus_section_html = f"""
-                <div style='margin-top:14px;padding-top:14px;
-                            border-top:1px solid rgba(0,0,0,0.08)'>
-                    <p style='margin:0;font-size:0.85rem;color:#6B7280'>
-                        🚌 Bus numbers unavailable for this corridor.<br>
-                        <span style='font-size:0.75rem'>{note}</span>
-                    </p>
-                </div>
-                """
-
-            # ── Weather & time meta-line ──────────────────────────────────────
+            # ── Weather & time meta ───────────────────────────────────────────
             weather_icon = "🌧️ Rain" if is_rain else "☀️ Clear"
-            rush_note    = ""
-            if hour in [7, 8, 9]:
-                rush_note = " &nbsp;·&nbsp; 🔴 AM Rush"
-            elif hour in [17, 18, 19]:
-                rush_note = " &nbsp;·&nbsp; 🔴 PM Rush"
+            rush_note    = " · 🔴 AM Rush" if hour in [7,8,9] else (
+                           " · 🔴 PM Rush" if hour in [17,18,19] else "")
 
-            # ── Tip text ─────────────────────────────────────────────────────
+            # ── Tip ──────────────────────────────────────────────────────────
             if worse >= 8:
                 tip_bg, tip_icon, tip_text = "#FEE2E2", "🔴", "Leave early — heavy delays expected!"
             elif worse >= 3:
@@ -630,90 +582,156 @@ with tab1:
             else:
                 tip_bg, tip_icon, tip_text = "#D1FAE5", "✅", "Good time to travel — minimal delays expected."
 
+            # ── Source badge ─────────────────────────────────────────────────
+            dot_color, dot_label = {
+                "live"  : ("#22C55E", "🟢 Live data"),
+                "gtfs"  : ("#16A34A", "🟢 BMTC GTFS data"),
+                "static": ("#F97316", "🟠 Estimated"),
+                "none"  : ("#9CA3AF", "⚪ Not found"),
+            }.get(source, ("#9CA3AF", ""))
+
+            # ── Bus pills HTML (no f-string quotes inside style) ─────────────
+            PILL = (
+                "display:inline-block;"
+                "background:#1E3A5F;"
+                "color:#E0F2FE;"
+                "border-radius:6px;"
+                "padding:4px 10px;"
+                "margin:3px 4px 3px 0;"
+                "font-weight:700;"
+                "font-size:0.9rem;"
+                "letter-spacing:0.02em"
+            )
+            if buses:
+                pills = "".join(f'<span style="{PILL}">{b}</span>' for b in buses)
+                bus_html = (
+                    '<div style="margin-top:14px;padding-top:14px;'
+                    'border-top:1px solid #E2E8F0">'
+                    '<p style="margin:0 0 8px 0;font-weight:700;color:#1A3A5C;font-size:0.9rem">'
+                    "🚌 Buses on this corridor</p>"
+                    f'<div style="line-height:2">{pills}</div>'
+                    f'<p style="margin:8px 0 0 0;font-size:0.75rem;color:{dot_color}">'
+                    f"{dot_label} · {note}</p>"
+                    "</div>"
+                )
+            else:
+                bus_html = (
+                    '<div style="margin-top:14px;padding-top:14px;'
+                    'border-top:1px solid #E2E8F0">'
+                    '<p style="margin:0;font-size:0.85rem;color:#6B7280">'
+                    f"🚌 Bus numbers unavailable for this corridor.<br>"
+                    f'<span style="font-size:0.75rem">{note}</span></p>'
+                    "</div>"
+                )
+
             # ══════════════════════════════════════════════════════════════════
-            # UNIFIED OUTPUT CARD
+            # UNIFIED OUTPUT CARD — rendered via st.components.v1.html()
+            # so Streamlit's markdown parser never touches the HTML
             # ══════════════════════════════════════════════════════════════════
+            import streamlit.components.v1 as components
+
+            card_html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  body {{ margin:0; padding:0; font-family: -apple-system, BlinkMacSystemFont,
+          'Segoe UI', Roboto, sans-serif; background:transparent; }}
+  .card {{
+    background:#FFFFFF;
+    border:1px solid #E2E8F0;
+    border-radius:14px;
+    padding:22px 24px 18px 24px;
+    box-shadow:0 2px 12px rgba(0,0,0,0.07);
+  }}
+  .meta {{ font-size:0.8rem; color:#64748B; margin:4px 0 16px 0; }}
+  .route-header {{ display:flex; align-items:center; gap:8px; margin-bottom:4px; }}
+  .route-header span {{ font-size:1.05rem; font-weight:700; color:#1A3A5C; }}
+  .route-header .arrow {{ color:#64748B; font-size:1.1rem; }}
+  .grid {{ display:grid; grid-template-columns:1fr 1fr; gap:12px; }}
+  .delay-card {{
+    border-radius:10px;
+    padding:16px 18px;
+  }}
+  .delay-card .role {{
+    margin:0 0 2px 0;
+    font-size:0.72rem;
+    font-weight:700;
+    text-transform:uppercase;
+    letter-spacing:0.07em;
+  }}
+  .delay-card .stop-name {{
+    margin:0 0 6px 0;
+    font-size:0.85rem;
+    font-weight:600;
+  }}
+  .delay-card .delay-val {{
+    margin:0;
+    font-size:2rem;
+    font-weight:800;
+    line-height:1;
+  }}
+  .delay-card .delay-val span {{ font-size:1rem; font-weight:500; }}
+  .delay-card .status {{
+    margin:4px 0 0 0;
+    font-size:0.85rem;
+  }}
+  .tip {{
+    margin-top:14px;
+    border-radius:8px;
+    padding:10px 14px;
+    font-size:0.88rem;
+    font-weight:600;
+    color:#1A3A5C;
+  }}
+</style>
+</head>
+<body>
+<div class="card">
+
+  <div class="route-header">
+    <span>📍 {src_stop}</span>
+    <span class="arrow">→</span>
+    <span>🏁 {dst_stop}</span>
+  </div>
+  <p class="meta">
+    📅 {travel_date.strftime('%d %b %Y')} ({day})
+    &nbsp;·&nbsp; ⏰ {selected_label}
+    &nbsp;·&nbsp; {weather_icon}{rush_note}
+  </p>
+
+  <div class="grid">
+    <div class="delay-card"
+         style="background:{src_bg};border-left:5px solid {src_color}">
+      <p class="role"    style="color:{src_color}">FROM</p>
+      <p class="stop-name" style="color:{src_color}">{src_stop}</p>
+      <p class="delay-val" style="color:{src_color}">{src_delay}
+         <span>min</span></p>
+      <p class="status"  style="color:{src_color}">{src_label}</p>
+    </div>
+    <div class="delay-card"
+         style="background:{dst_bg};border-left:5px solid {dst_color}">
+      <p class="role"    style="color:{dst_color}">TO</p>
+      <p class="stop-name" style="color:{dst_color}">{dst_stop}</p>
+      <p class="delay-val" style="color:{dst_color}">{dst_delay}
+         <span>min</span></p>
+      <p class="status"  style="color:{dst_color}">{dst_label}</p>
+    </div>
+  </div>
+
+  {bus_html}
+
+  <div class="tip" style="background:{tip_bg}">
+    {tip_icon} {tip_text}
+  </div>
+
+</div>
+</body>
+</html>
+"""
             st.markdown("---")
-            st.markdown(f"""
-            <div style='
-                background:#FFFFFF;
-                border:1px solid #E2E8F0;
-                border-radius:14px;
-                padding:22px 24px 18px 24px;
-                box-shadow:0 2px 12px rgba(0,0,0,0.07);
-                margin-top:4px
-            '>
-                <!-- ── Journey meta header ── -->
-                <div style='display:flex;align-items:center;gap:8px;margin-bottom:4px'>
-                    <span style='font-size:1.05rem;font-weight:700;color:#1A3A5C'>
-                        📍 {src_stop}
-                    </span>
-                    <span style='color:#64748B;font-size:1.1rem'>→</span>
-                    <span style='font-size:1.05rem;font-weight:700;color:#1A3A5C'>
-                        🏁 {dst_stop}
-                    </span>
-                </div>
-                <p style='margin:0 0 16px 0;font-size:0.8rem;color:#64748B'>
-                    📅 {travel_date.strftime('%d %b %Y')} ({day})
-                    &nbsp;·&nbsp; ⏰ {selected_label}
-                    &nbsp;·&nbsp; {weather_icon}{rush_note}
-                </p>
-
-                <!-- ── Two delay sub-cards side by side ── -->
-                <div style='display:grid;grid-template-columns:1fr 1fr;gap:12px'>
-
-                    <div style='
-                        background:{src_bg};
-                        border-left:5px solid {src_color};
-                        border-radius:10px;
-                        padding:16px 18px
-                    '>
-                        <p style='margin:0 0 2px 0;font-size:0.75rem;
-                                  font-weight:600;color:{src_color};text-transform:uppercase;
-                                  letter-spacing:0.06em'>FROM</p>
-                        <p style='margin:0 0 6px 0;font-size:0.85rem;
-                                  font-weight:600;color:{src_color}'>{src_stop}</p>
-                        <p style='margin:0;font-size:2rem;font-weight:800;
-                                  color:{src_color};line-height:1'>{src_delay} <span style='font-size:1rem'>min</span></p>
-                        <p style='margin:4px 0 0 0;font-size:0.85rem;color:{src_color}'>{src_label}</p>
-                    </div>
-
-                    <div style='
-                        background:{dst_bg};
-                        border-left:5px solid {dst_color};
-                        border-radius:10px;
-                        padding:16px 18px
-                    '>
-                        <p style='margin:0 0 2px 0;font-size:0.75rem;
-                                  font-weight:600;color:{dst_color};text-transform:uppercase;
-                                  letter-spacing:0.06em'>TO</p>
-                        <p style='margin:0 0 6px 0;font-size:0.85rem;
-                                  font-weight:600;color:{dst_color}'>{dst_stop}</p>
-                        <p style='margin:0;font-size:2rem;font-weight:800;
-                                  color:{dst_color};line-height:1'>{dst_delay} <span style='font-size:1rem'>min</span></p>
-                        <p style='margin:4px 0 0 0;font-size:0.85rem;color:{dst_color}'>{dst_label}</p>
-                    </div>
-
-                </div>
-
-                <!-- ── Bus numbers (wired from find_buses) ── -->
-                {bus_section_html}
-
-                <!-- ── Travel tip banner ── -->
-                <div style='
-                    margin-top:14px;
-                    background:{tip_bg};
-                    border-radius:8px;
-                    padding:10px 14px;
-                    font-size:0.88rem;
-                    font-weight:600;
-                    color:#1A3A5C
-                '>
-                    {tip_icon} {tip_text}
-                </div>
-
-            </div>
-            """, unsafe_allow_html=True)
+            components.html(card_html, height=420, scrolling=False)
 
             # ── 24-hour forecast chart ────────────────────────────────────────
             st.markdown("#### 24-Hour Delay Forecast")
