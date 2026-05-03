@@ -677,6 +677,7 @@ with tab1:
         elif src_stop == dst_stop:
             st.error("FROM and TO stops cannot be the same.")
         else:
+            # ── Run delay prediction + bus lookup in parallel ─────────────────
             src_delay = predict_delay(src_stop, hour, dow, month, is_rain)
             dst_delay = predict_delay(dst_stop, hour, dow, month, is_rain)
 
@@ -684,16 +685,6 @@ with tab1:
             dst_label, dst_color, dst_bg = get_status(dst_delay)
             worse = max(src_delay, dst_delay)
 
-            # ── Journey header ────────────────────────────────────────────────
-            st.markdown("---")
-            weather_note = f"🌧️ Rain" if is_rain else "☀️ Clear"
-            st.markdown(
-                f"**Journey:** {src_stop} → {dst_stop} &nbsp;|&nbsp; "
-                f"**{travel_date.strftime('%d %b %Y')} ({day}) "
-                f"{selected_label}** &nbsp;|&nbsp; {weather_note}"
-            )
-
-            # ── Bus numbers ───────────────────────────────────────────────────
             with st.spinner("🔍 Looking up bus numbers..."):
                 bus_result = find_buses(src_stop, dst_stop)
 
@@ -701,51 +692,147 @@ with tab1:
             source = bus_result["source"]
             note   = bus_result["note"]
 
+            # ── Build bus-number HTML for the unified card ────────────────────
+            source_dot = {
+                "live"  : ("#22C55E", "🟢 Live data"),
+                "gtfs"  : ("#EAB308", "🟡 GTFS offline"),
+                "static": ("#F97316", "🟠 Estimated"),
+                "none"  : ("#9CA3AF", "⚪ Not found"),
+            }.get(source, ("#9CA3AF", ""))
+            dot_color, dot_label = source_dot
+
             if buses:
-                bus_tags = "  ".join([f"`{b}`" for b in buses])
-                source_badge = {
-                    "live"  : "🟢 Live",
-                    "gtfs"  : "🟡 GTFS",
-                    "static": "🟠 Estimated",
-                }.get(source, "")
-                st.markdown(
-                    f"🚌 **Bus Numbers:** {bus_tags}  \n"
-                    f"<small style='color:gray'>{source_badge} · {note}</small>",
-                    unsafe_allow_html=True,
+                bus_pills_html = "".join(
+                    f"<span style='"
+                    f"display:inline-block;background:#1E3A5F;color:#E0F2FE;"
+                    f"border-radius:6px;padding:4px 10px;margin:3px 4px 3px 0;"
+                    f"font-weight:700;font-size:0.95rem;letter-spacing:0.03em"
+                    f"'>{b}</span>"
+                    for b in buses
                 )
+                bus_section_html = f"""
+                <div style='margin-top:14px;padding-top:14px;
+                            border-top:1px solid rgba(0,0,0,0.08)'>
+                    <p style='margin:0 0 6px 0;font-weight:600;color:#1A3A5C;font-size:0.9rem'>
+                        🚌 Buses on this corridor
+                    </p>
+                    <div>{bus_pills_html}</div>
+                    <p style='margin:6px 0 0 0;font-size:0.75rem;color:{dot_color}'>
+                        {dot_label} · {note}
+                    </p>
+                </div>
+                """
             else:
-                st.markdown(
-                    "🚌 **Bus Numbers:** Route data unavailable for this corridor.  \n"
-                    f"<small style='color:gray'>{note}</small>",
-                    unsafe_allow_html=True,
-                )
+                bus_section_html = f"""
+                <div style='margin-top:14px;padding-top:14px;
+                            border-top:1px solid rgba(0,0,0,0.08)'>
+                    <p style='margin:0;font-size:0.85rem;color:#6B7280'>
+                        🚌 Bus numbers unavailable for this corridor.<br>
+                        <span style='font-size:0.75rem'>{note}</span>
+                    </p>
+                </div>
+                """
 
-            # ── Delay result cards ────────────────────────────────────────────
-            c1, c2 = st.columns(2)
-            for col, stop, delay, label, color, bg in [
-                (c1, src_stop, src_delay, src_label, src_color, src_bg),
-                (c2, dst_stop, dst_delay, dst_label, dst_color, dst_bg),
-            ]:
-                with col:
-                    role = "FROM" if col == c1 else "TO"
-                    st.markdown(f"""
-                    <div style='background:{bg};padding:20px;border-radius:10px;
-                                border-left:5px solid {color};margin-top:10px'>
-                        <p style='margin:0;color:{color};font-weight:bold'>
-                            {role}: {stop}</p>
-                        <h2 style='margin:8px 0;color:{color}'>{delay} min</h2>
-                        <p style='margin:0;color:{color}'>{label}</p>
-                    </div>
-                    """, unsafe_allow_html=True)
+            # ── Weather & time meta-line ──────────────────────────────────────
+            weather_icon = "🌧️ Rain" if is_rain else "☀️ Clear"
+            rush_note    = ""
+            if hour in [7, 8, 9]:
+                rush_note = " &nbsp;·&nbsp; 🔴 AM Rush"
+            elif hour in [17, 18, 19]:
+                rush_note = " &nbsp;·&nbsp; 🔴 PM Rush"
 
-            # ── Travel tip ────────────────────────────────────────────────────
-            st.markdown("<br>", unsafe_allow_html=True)
+            # ── Tip text ─────────────────────────────────────────────────────
             if worse >= 8:
-                st.error("💡 Leave early — heavy delays expected on this route!")
+                tip_bg, tip_icon, tip_text = "#FEE2E2", "🔴", "Leave early — heavy delays expected!"
             elif worse >= 3:
-                st.warning("💡 Keep a 10-minute buffer for this journey.")
+                tip_bg, tip_icon, tip_text = "#FEF3C7", "⚠️", "Keep a 10-minute buffer for this journey."
             else:
-                st.success("💡 Good time to travel — minimal delays expected.")
+                tip_bg, tip_icon, tip_text = "#D1FAE5", "✅", "Good time to travel — minimal delays expected."
+
+            # ══════════════════════════════════════════════════════════════════
+            # UNIFIED OUTPUT CARD
+            # ══════════════════════════════════════════════════════════════════
+            st.markdown("---")
+            st.markdown(f"""
+            <div style='
+                background:#FFFFFF;
+                border:1px solid #E2E8F0;
+                border-radius:14px;
+                padding:22px 24px 18px 24px;
+                box-shadow:0 2px 12px rgba(0,0,0,0.07);
+                margin-top:4px
+            '>
+                <!-- ── Journey meta header ── -->
+                <div style='display:flex;align-items:center;gap:8px;margin-bottom:4px'>
+                    <span style='font-size:1.05rem;font-weight:700;color:#1A3A5C'>
+                        📍 {src_stop}
+                    </span>
+                    <span style='color:#64748B;font-size:1.1rem'>→</span>
+                    <span style='font-size:1.05rem;font-weight:700;color:#1A3A5C'>
+                        🏁 {dst_stop}
+                    </span>
+                </div>
+                <p style='margin:0 0 16px 0;font-size:0.8rem;color:#64748B'>
+                    📅 {travel_date.strftime('%d %b %Y')} ({day})
+                    &nbsp;·&nbsp; ⏰ {selected_label}
+                    &nbsp;·&nbsp; {weather_icon}{rush_note}
+                </p>
+
+                <!-- ── Two delay sub-cards side by side ── -->
+                <div style='display:grid;grid-template-columns:1fr 1fr;gap:12px'>
+
+                    <div style='
+                        background:{src_bg};
+                        border-left:5px solid {src_color};
+                        border-radius:10px;
+                        padding:16px 18px
+                    '>
+                        <p style='margin:0 0 2px 0;font-size:0.75rem;
+                                  font-weight:600;color:{src_color};text-transform:uppercase;
+                                  letter-spacing:0.06em'>FROM</p>
+                        <p style='margin:0 0 6px 0;font-size:0.85rem;
+                                  font-weight:600;color:{src_color}'>{src_stop}</p>
+                        <p style='margin:0;font-size:2rem;font-weight:800;
+                                  color:{src_color};line-height:1'>{src_delay} <span style='font-size:1rem'>min</span></p>
+                        <p style='margin:4px 0 0 0;font-size:0.85rem;color:{src_color}'>{src_label}</p>
+                    </div>
+
+                    <div style='
+                        background:{dst_bg};
+                        border-left:5px solid {dst_color};
+                        border-radius:10px;
+                        padding:16px 18px
+                    '>
+                        <p style='margin:0 0 2px 0;font-size:0.75rem;
+                                  font-weight:600;color:{dst_color};text-transform:uppercase;
+                                  letter-spacing:0.06em'>TO</p>
+                        <p style='margin:0 0 6px 0;font-size:0.85rem;
+                                  font-weight:600;color:{dst_color}'>{dst_stop}</p>
+                        <p style='margin:0;font-size:2rem;font-weight:800;
+                                  color:{dst_color};line-height:1'>{dst_delay} <span style='font-size:1rem'>min</span></p>
+                        <p style='margin:4px 0 0 0;font-size:0.85rem;color:{dst_color}'>{dst_label}</p>
+                    </div>
+
+                </div>
+
+                <!-- ── Bus numbers (wired from find_buses) ── -->
+                {bus_section_html}
+
+                <!-- ── Travel tip banner ── -->
+                <div style='
+                    margin-top:14px;
+                    background:{tip_bg};
+                    border-radius:8px;
+                    padding:10px 14px;
+                    font-size:0.88rem;
+                    font-weight:600;
+                    color:#1A3A5C
+                '>
+                    {tip_icon} {tip_text}
+                </div>
+
+            </div>
+            """, unsafe_allow_html=True)
 
             # ── 24-hour forecast chart ────────────────────────────────────────
             st.markdown("#### 24-Hour Delay Forecast")
