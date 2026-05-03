@@ -11,8 +11,6 @@ import json
 import os
 import re
 import requests
-from bs4 import BeautifulSoup
-from urllib.parse import quote
 from difflib import get_close_matches
 from datetime import date, datetime, timedelta
 import pytz
@@ -136,26 +134,13 @@ def load_prophet_model(stop_name):
     with open(path) as f:
         return model_from_json(f.read())
 
-@st.cache_data
-def load_routes():
-    path = os.path.join(MODEL_DIR, "routes.csv")
-    if os.path.exists(path):
-        df = pd.read_csv(path)
-        # routes.csv has columns: name, full_name, trip_count, stop_count, id, direction_id, geometry
-        # We only need name, full_name, trip_count
-        df = df[["name", "full_name", "trip_count"]].copy()
-        df.columns = ["bus_number", "full_name", "trip_count"]
-        df["full_name_lower"] = df["full_name"].str.lower().fillna("")
-        return df
-    return pd.DataFrame(columns=["bus_number", "full_name",
-                                  "trip_count", "full_name_lower"])
+# routes.csv / load_routes() removed — bus lookup now uses GTFS join (models/gtfs/)
 
 # ── Load everything at startup ────────────────────────────────────────────────
 try:
     xgb_model, stop_summary, metadata = load_assets()
     final_results = load_results()
     prophet_stops = load_prophet_stops()
-    routes_df     = load_routes()
     FEATURES      = metadata["features"]
     all_stops     = sorted(stop_summary["stop_name"].tolist())
 except Exception as e:
@@ -177,310 +162,195 @@ def find_stop(query, n=6):
     return [s for s in all_stops if s.lower() in fuzzy]
 
 # ══════════════════════════════════════════════════════════════════════════════
-# BUS NUMBER LOOKUP  —  3-tier live pipeline
+# BUS NUMBER LOOKUP  —  GTFS proper join pipeline
 # ══════════════════════════════════════════════════════════════════════════════
 #
-#  TIER 1  narasimhadatta.info  — community-maintained BMTC stop→route DB
-#          Scrapes the HTML form result page. No official BMTC involvement.
+#  HOW IT WORKS (stop_name → bus numbers):
 #
-#  TIER 2  routes.csv (local GTFS)  — offline fallback using the BMTC GTFS
-#          dataset already bundled with the project.  Matches via area keyword
-#          extraction + confidence scoring.
+#   stops.txt       stop_name  ──►  stop_id
+#       ↓
+#   stop_times.txt  stop_id    ──►  trip_id  (all trips that call at this stop)
+#       ↓
+#   trips.txt       trip_id    ──►  route_id
+#       ↓
+#   routes.txt      route_id   ──►  route_short_name  (the bus number e.g. "335E")
 #
-#  TIER 3  Hard-coded corridor map  — last-resort table for the most common
-#          Bengaluru O-D pairs that frequently fail both tiers due to stop-name
-#          aliasing (e.g. "Majestic" vs "Kempegowda Bus Station").
+#  For a FROM→TO pair we do this for both stops, then intersect the two sets
+#  of route_short_names → those are the buses that directly serve both stops.
 #
-#  The result dict schema returned by ALL tiers:
-#   {
-#     "buses"   : ["335E", "201", ...],   # up to 7 bus numbers
-#     "source"  : "live" | "gtfs" | "static",
-#     "note"    : str,                    # human-readable provenance note
-#     "hops"    : int,                    # 1 = direct, 2 = with transfer
-#   }
+#  FILES REQUIRED (place in models/gtfs/):
+#    stops.txt, stop_times.txt, trips.txt, routes.txt
+#
+#  If the gtfs/ folder is absent the app falls back gracefully with a message.
 # ──────────────────────────────────────────────────────────────────────────────
 
-# ── Stop-name normalisation helpers ──────────────────────────────────────────
+GTFS_DIR = os.path.join(MODEL_DIR, "gtfs")
 
-_SUFFIX_RE = re.compile(
-    r"\b(police station|bus station|bus stand|bus stop|railway station|"
-    r"metro station|metro|circle|gate|junction|flyover|bridge|hospital|"
-    r"school|college|depot|terminal|ttmc|cross|road|layout|nagar|stage)\b",
-    re.IGNORECASE,
-)
-_SKIP = {"bus","stop","the","and","for","near","main","old","new","town","cs"}
-
-def _area_tokens(stop_name: str) -> list[str]:
-    """Return bare locality tokens from a full stop name."""
-    name = _SUFFIX_RE.sub("", stop_name.lower()).strip(" -,")
-    tokens = [w for w in re.split(r"[\s\-/]+", name)
-              if len(w) > 2 and w not in _SKIP]
-    return tokens
-
-# Canonical alias map — maps common user terms → narasimhadatta stop spellings
-_ALIAS: dict[str, str] = {
-    "majestic"               : "Kempegowda Bus Station (Majestic)",
-    "kbs"                    : "Kempegowda Bus Station (Majestic)",
-    "kempegowda bus station" : "Kempegowda Bus Station (Majestic)",
-    "silk board"             : "Silk Board",
-    "silkboard"              : "Silk Board",
-    "koramangala"            : "Koramangala",
-    "indiranagar"            : "Indira Nagar",
-    "indira nagar"           : "Indira Nagar",
-    "hebbal"                 : "Hebbal",
-    "kr market"              : "KR Market",
-    "shivajinagar"           : "Shivajinagar Bus Station",
-    "jayanagar"              : "Jayanagar 4th Block Bus Station",
-    "banashankari"           : "Banashankari",
-    "yeshwanthpur"           : "Yeshawanthapura Bus Station",
-    "yeshawanthpura"         : "Yeshawanthapura Bus Station",
-    "whitefield"             : "Whitefield",
-    "electronic city"        : "Electronic City",
-    "bommanahalli"           : "Bommanahalli",
-    "marathahalli"           : "Marathahalli",
-    "yelahanka"              : "Yelahanka",
-    "airport"                : "Kempegowda International Airport",
-    "kia"                    : "Kempegowda International Airport",
-}
-
-def _canonical(stop_name: str) -> str:
-    """Resolve common aliases to the form narasimhadatta.info understands."""
-    key = stop_name.lower().strip()
-    return _ALIAS.get(key, stop_name)
-
-# ── Tier-3 static corridor table ─────────────────────────────────────────────
-# Tuples: (src_tokens, dst_tokens, bus_list)
-# src/dst_tokens are sets of lowercase keywords; matched with set intersection.
-
-_STATIC_CORRIDORS: list[tuple[frozenset, frozenset, list[str]]] = [
-    (frozenset({"halasuru"}),      frozenset({"kempegowda","majestic","kbs"}), ["335E","225","401"]),
-    (frozenset({"halasuru"}),      frozenset({"shivajinagar"}),                ["335E","225"]),
-    (frozenset({"indiranagar","indira"}), frozenset({"kempegowda","majestic"}),["335E","201","225"]),
-    (frozenset({"koramangala"}),   frozenset({"kempegowda","majestic"}),       ["201","201A","335"]),
-    (frozenset({"silk","board"}),  frozenset({"kempegowda","majestic"}),       ["201","335","374"]),
-    (frozenset({"hebbal"}),        frozenset({"kempegowda","majestic"}),       ["401","401B","G1"]),
-    (frozenset({"yelahanka"}),     frozenset({"kempegowda","majestic"}),       ["241","G1","KIA-9"]),
-    (frozenset({"electronic","city"}), frozenset({"kempegowda","majestic"}),   ["500C","500D","600F"]),
-    (frozenset({"whitefield"}),    frozenset({"kempegowda","majestic"}),       ["335B","335E"]),
-    (frozenset({"marathahalli"}),  frozenset({"kempegowda","majestic"}),       ["335B","500C"]),
-    (frozenset({"jayanagar"}),     frozenset({"kempegowda","majestic"}),       ["201","201A","225"]),
-    (frozenset({"banashankari"}),  frozenset({"kempegowda","majestic"}),       ["501-BH","210","211"]),
-    (frozenset({"hebbal"}),        frozenset({"whitefield"}),                  ["333","333A"]),
-    (frozenset({"koramangala"}),   frozenset({"whitefield"}),                  ["500C","500D"]),
-]
-
-def _static_lookup(src: str, dst: str) -> list[str]:
-    """Return buses from the static corridor table, or []."""
-    src_tok = set(_area_tokens(src))
-    dst_tok = set(_area_tokens(dst))
-    # also try reversed direction
-    for s_keys, d_keys, buses in _STATIC_CORRIDORS:
-        if (s_keys & src_tok) and (d_keys & dst_tok):
-            return buses
-        if (s_keys & dst_tok) and (d_keys & src_tok):   # reverse direction
-            return buses
-    return []
-
-# ── Tier-2 GTFS local lookup ──────────────────────────────────────────────────
-
-def _gtfs_lookup(src: str, dst: str) -> list[str]:
+@st.cache_resource(show_spinner=False)
+def load_gtfs_tables():
     """
-    Match against routes.csv using area-token scoring.
-    Returns list of bus numbers (may be empty).
+    Load the four GTFS text files and build a dict:
+      stop_name_lower  →  set of route_short_name strings
+
+    Returns (lookup_dict, True) on success, ({}, False) if files are missing.
+    The heavy join is done once at startup and cached for the whole session.
     """
-    if routes_df.empty:
-        return []
+    required = ["stops.txt", "stop_times.txt", "trips.txt", "routes.txt"]
+    paths    = {f: os.path.join(GTFS_DIR, f) for f in required}
 
-    src_keys = _area_tokens(src)
-    dst_keys = _area_tokens(dst)
+    if not all(os.path.exists(p) for p in paths.values()):
+        return {}, False
 
-    bus_best: dict[str, tuple[int, int, str]] = {}
+    # ── 1. stops: stop_id → stop_name ────────────────────────────────────────
+    stops = pd.read_csv(
+        paths["stops.txt"],
+        usecols=["stop_id", "stop_name"],
+        dtype=str,
+    ).dropna()
+    stops["stop_name_lower"] = stops["stop_name"].str.lower().str.strip()
+    stop_id_to_name = stops.set_index("stop_id")["stop_name"].to_dict()
 
-    for _, row in routes_df.iterrows():
-        text = row["full_name_lower"]
-        s = sum(1 for k in src_keys if k in text)
-        d = sum(1 for k in dst_keys if k in text)
-        conf = 3 if (s >= 1 and d >= 1) else (2 if s >= 1 else (1 if d >= 1 else 0))
-        if conf == 0:
-            continue
-        bus, tc = row["bus_number"], int(row["trip_count"])
-        if bus not in bus_best or (conf, tc) > (bus_best[bus][0], bus_best[bus][1]):
-            bus_best[bus] = (conf, tc, row["full_name"])
+    # ── 2. routes: route_id → route_short_name ───────────────────────────────
+    routes = pd.read_csv(
+        paths["routes.txt"],
+        usecols=["route_id", "route_short_name"],
+        dtype=str,
+    ).dropna()
+    route_id_to_short = routes.set_index("route_id")["route_short_name"].to_dict()
 
-    if not bus_best:
-        return []
+    # ── 3. trips: trip_id → route_id ─────────────────────────────────────────
+    trips = pd.read_csv(
+        paths["trips.txt"],
+        usecols=["trip_id", "route_id"],
+        dtype=str,
+    ).dropna()
+    trip_id_to_route = trips.set_index("trip_id")["route_id"].to_dict()
 
-    return [
-        bus for bus, _ in
-        sorted(bus_best.items(), key=lambda x: (x[1][0], x[1][1]), reverse=True)[:7]
-    ]
+    # ── 4. stop_times: stop_id → set of trip_ids ─────────────────────────────
+    # stop_times.txt is the largest file — read only the two columns we need
+    stop_times = pd.read_csv(
+        paths["stop_times.txt"],
+        usecols=["trip_id", "stop_id"],
+        dtype=str,
+    ).dropna()
 
-# ── Tier-1 live scraper  ──────────────────────────────────────────────────────
-#
-#  Target: narasimhadatta.info/bmtc_query.html
-#  Method: POST the HTML <form> with from/to values → parse result table.
-#  The site has no robots.txt restriction and is explicitly public-use.
-#  We cap at 1 call per (src, dst) pair via st.cache_data(ttl=3600).
+    # ── 5. Build final lookup: stop_name_lower → set[route_short_name] ───────
+    # Merge stop_times → trips → routes in one vectorised pass
+    stop_times["route_id"] = stop_times["trip_id"].map(trip_id_to_route)
+    stop_times["route_short_name"] = stop_times["route_id"].map(route_id_to_short)
+    stop_times["stop_name_lower"] = stop_times["stop_id"].map(
+        stops.set_index("stop_id")["stop_name_lower"]
+    )
+    stop_times = stop_times.dropna(
+        subset=["stop_name_lower", "route_short_name"]
+    )
 
-_SCRAPE_BASE    = "https://narasimhadatta.info"
-_SCRAPE_FORM    = f"{_SCRAPE_BASE}/bmtc_query.html"
-_SCRAPE_HEADERS = {
-    "User-Agent"  : "Mozilla/5.0 (BMTC Delay Predictor/1.0; research use)",
-    "Referer"     : _SCRAPE_FORM,
-    "Accept"      : "text/html,application/xhtml+xml",
-}
+    lookup: dict[str, set] = {}
+    for row in stop_times[["stop_name_lower", "route_short_name"]].itertuples(index=False):
+        lookup.setdefault(row.stop_name_lower, set()).add(row.route_short_name)
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def _scrape_narasimhadatta(src: str, dst: str) -> list[str]:
+    return lookup, True
+
+
+def _best_gtfs_match(query: str, lookup: dict) -> str | None:
     """
-    POST the narasimhadatta.info BMTC route search form and parse the result.
-    Returns a list of bus number strings, or [] on any failure.
-    Cached for 1 hour per (src, dst) pair.
+    Find the best matching stop_name_lower key in the GTFS lookup dict.
+    Tries exact substring first, then difflib fuzzy match.
+    Returns the matched key or None.
     """
-    try:
-        # Step 1: GET the form page to extract hidden fields + exact stop names
-        r0 = requests.get(_SCRAPE_FORM, headers=_SCRAPE_HEADERS, timeout=6)
-        r0.raise_for_status()
-        soup0 = BeautifulSoup(r0.text, "html.parser")
+    q = query.lower().strip()
+    # Exact match
+    if q in lookup:
+        return q
+    # Substring match (query is contained in a gtfs stop name)
+    substr = [k for k in lookup if q in k]
+    if substr:
+        # prefer the shortest match (most specific)
+        return min(substr, key=len)
+    # Reverse substring (gtfs stop name is contained in query)
+    substr2 = [k for k in lookup if k in q]
+    if substr2:
+        return max(substr2, key=len)
+    # Fuzzy fallback
+    matches = get_close_matches(q, list(lookup.keys()), n=1, cutoff=0.6)
+    return matches[0] if matches else None
 
-        # The form has two <select> elements with stop names; find closest match
-        selects = soup0.find_all("select")
-        if len(selects) < 2:
-            return []
-
-        def best_option(select_tag, query: str):
-            opts = [o.get("value", o.text.strip()) for o in select_tag.find_all("option") if o.get("value")]
-            q = query.lower()
-            # exact substring first
-            exact = [o for o in opts if q in o.lower()]
-            if exact:
-                return exact[0]
-            # fuzzy fallback
-            matches = get_close_matches(q, [o.lower() for o in opts], n=1, cutoff=0.5)
-            if matches:
-                return next(o for o in opts if o.lower() == matches[0])
-            return None
-
-        src_val = best_option(selects[0], _canonical(src))
-        dst_val = best_option(selects[1], _canonical(dst))
-
-        # Also try the area-token version if canonical didn't match
-        if not src_val:
-            for tok in _area_tokens(src):
-                src_val = best_option(selects[0], tok)
-                if src_val:
-                    break
-        if not dst_val:
-            for tok in _area_tokens(dst):
-                dst_val = best_option(selects[1], tok)
-                if dst_val:
-                    break
-
-        if not src_val or not dst_val:
-            return []   # stop names not found in the site's drop-down
-
-        # Step 2: Build POST payload (mirror the form's field names)
-        form = soup0.find("form")
-        action = form.get("action", "bmtc_result.php") if form else "bmtc_result.php"
-        post_url = f"{_SCRAPE_BASE}/{action.lstrip('/')}"
-
-        payload: dict[str, str] = {}
-        # Copy hidden inputs
-        for inp in soup0.find_all("input", {"type": "hidden"}):
-            payload[inp["name"]] = inp.get("value", "")
-        # Set the two selects
-        payload[selects[0].get("name", "from")] = src_val
-        payload[selects[1].get("name", "to")]   = dst_val
-        # Submit button value (some forms require it)
-        btn = soup0.find("input", {"type": "submit"})
-        if btn and btn.get("name"):
-            payload[btn["name"]] = btn.get("value", "Search")
-
-        # Step 3: POST and parse result
-        r1 = requests.post(post_url, data=payload,
-                           headers=_SCRAPE_HEADERS, timeout=8)
-        r1.raise_for_status()
-        soup1 = BeautifulSoup(r1.text, "html.parser")
-
-        buses: list[str] = []
-
-        # The result page lists bus numbers in <td> cells; extract them.
-        # Pattern: cells that look like bus numbers (e.g. "335E", "201", "500-C")
-        _BUS_RE = re.compile(r"^[A-Z0-9][A-Z0-9\-]{0,8}$")
-        for td in soup1.find_all("td"):
-            raw = td.get_text(separator=" ", strip=True)
-            # A bus-number cell is short and matches the pattern
-            if raw and _BUS_RE.match(raw) and len(raw) <= 12:
-                buses.append(raw)
-            # Also catch comma-separated lists like "335E, 201, 500C"
-            if "," in raw:
-                parts = [p.strip() for p in raw.split(",")]
-                for p in parts:
-                    if _BUS_RE.match(p) and len(p) <= 12:
-                        buses.append(p)
-
-        # Deduplicate while preserving order
-        seen: set[str] = set()
-        unique: list[str] = []
-        for b in buses:
-            if b not in seen:
-                seen.add(b)
-                unique.append(b)
-
-        return unique[:8]
-
-    except Exception:
-        return []   # any network / parse failure → fall through to next tier
-
-# ── Public entry point ────────────────────────────────────────────────────────
 
 def find_buses(src: str, dst: str) -> dict:
     """
-    Main bus-number lookup.  Tries Tier 1 → 2 → 3 in order.
+    Look up bus numbers that serve both src and dst stops using GTFS data.
 
-    Returns a dict:
+    Returns:
       {
-        "buses"  : list[str],          # bus numbers found
-        "source" : "live"|"gtfs"|"static"|"none",
-        "note"   : str,                # shown in the UI
-        "hops"   : int,                # 1 direct, 2 with transfer
+        "buses"  : list[str],   # route_short_names serving both stops
+        "source" : "gtfs" | "none",
+        "note"   : str,
+        "hops"   : int,         # 1 = direct routes found
       }
     """
-    # ── Tier 1: live scrape ───────────────────────────────────────────────────
-    live = _scrape_narasimhadatta(src, dst)
-    if live:
+    lookup, gtfs_ok = load_gtfs_tables()
+
+    if not gtfs_ok:
+        # GTFS files not present — inform the user clearly
         return {
-            "buses" : live,
-            "source": "live",
-            "note"  : "Live data · narasimhadatta.info (community BMTC database)",
-            "hops"  : 1,
+            "buses" : [],
+            "source": "none",
+            "note"  : (
+                "GTFS files not found in models/gtfs/. "
+                "Add stops.txt, stop_times.txt, trips.txt, routes.txt "
+                "to enable bus number lookup."
+            ),
+            "hops"  : 0,
         }
 
-    # ── Tier 2: local GTFS routes.csv ────────────────────────────────────────
-    gtfs = _gtfs_lookup(src, dst)
-    if gtfs:
+    src_key = _best_gtfs_match(src, lookup)
+    dst_key = _best_gtfs_match(dst, lookup)
+
+    if not src_key:
         return {
-            "buses" : gtfs,
+            "buses" : [],
+            "source": "none",
+            "note"  : f"Stop not found in GTFS: '{src}'. Try a nearby landmark name.",
+            "hops"  : 0,
+        }
+    if not dst_key:
+        return {
+            "buses" : [],
+            "source": "none",
+            "note"  : f"Stop not found in GTFS: '{dst}'. Try a nearby landmark name.",
+            "hops"  : 0,
+        }
+
+    src_routes = lookup[src_key]   # all routes serving FROM stop
+    dst_routes = lookup[dst_key]   # all routes serving TO stop
+
+    # Direct buses = routes that call at BOTH stops
+    direct = sorted(src_routes & dst_routes)
+
+    if direct:
+        return {
+            "buses" : direct[:10],   # cap at 10 to keep UI clean
             "source": "gtfs",
-            "note"  : "From bundled GTFS dataset · verify on BMTC app",
+            "note"  : (
+                f"BMTC GTFS data · matched '{src_key}' → '{dst_key}' · "
+                f"{len(direct)} direct route(s) found"
+            ),
             "hops"  : 1,
         }
 
-    # ── Tier 3: hard-coded corridor table ────────────────────────────────────
-    static = _static_lookup(src, dst)
-    if static:
-        return {
-            "buses" : static,
-            "source": "static",
-            "note"  : "Approximate — common corridor estimate · confirm on BMTC app",
-            "hops"  : 1,
-        }
-
+    # No direct buses — show routes serving each stop separately as a hint
+    src_list = sorted(src_routes)[:5]
+    dst_list = sorted(dst_routes)[:5]
     return {
         "buses" : [],
         "source": "none",
-        "note"  : "No route found. Try the BMTC app or mybmtc.karnataka.gov.in",
-        "hops"  : 0,
+        "note"  : (
+            f"No direct bus found. "
+            f"Buses at {src}: {', '.join(src_list) or 'none'}. "
+            f"Buses at {dst}: {', '.join(dst_list) or 'none'}. "
+            "You may need to transfer."
+        ),
+        "hops"  : 2,
     }
 
 def build_features(stop_name, hour, dow, month, is_rain):
@@ -691,6 +561,17 @@ with tab1:
             buses  = bus_result["buses"]
             source = bus_result["source"]
             note   = bus_result["note"]
+
+            # ── Sanitise note: convert any markdown links → plain <a> tags ─────
+            # find_buses may return notes like "[text](url)" – invalid inside HTML
+            def _md_link_to_html(text: str) -> str:
+                import re as _re
+                return _re.sub(
+                    r"\[([^\]]+)\]\((https?://[^\)]+)\)",
+                    r'<a href="\2" target="_blank" style="color:#3B82F6">\1</a>',
+                    text
+                )
+            note = _md_link_to_html(note)
 
             # ── Build bus-number HTML for the unified card ────────────────────
             source_dot = {
