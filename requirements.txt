@@ -7,4 +7,4 @@ scikit-learn
 joblib
 xgboost
 prophet
-BeautifulSoup
+beautifulsoup4
