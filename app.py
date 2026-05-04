@@ -408,9 +408,13 @@ st.markdown("""
     <hr>
 """, unsafe_allow_html=True)
 
-tab1, tab2, tab3 = st.tabs(["🔍 Predict Journey",
-                              "📊 Model Results",
-                              "ℹ️ About Project"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "🔍 Predict Journey",
+    "📊 Model Results",
+    "🧠 Delay Classifier",
+    "🛠️ Admin Dashboard",
+    "ℹ️ About Project",
+])
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 1 — JOURNEY PREDICTOR
@@ -879,7 +883,514 @@ with tab2:
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 3 — ABOUT
 # ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 3 — DELAY CLASSIFIER
+# ══════════════════════════════════════════════════════════════════════════════
 with tab3:
+    st.subheader("🧠 Delay Severity Classifier")
+    st.markdown(
+        "Classifies a stop's delay into **On-Time / Minor Delay / Major Delay** "
+        "using the XGBoost regression output + domain thresholds. "
+        "Shows predicted probability per class and the top feature drivers."
+    )
+    st.markdown("---")
+
+    # ── Inputs ────────────────────────────────────────────────────────────────
+    c1, c2 = st.columns(2)
+    with c1:
+        cls_stop_input = st.text_input("🔍 Stop Name", placeholder="e.g. Hebbal, Silk Board",
+                                       key="cls_stop")
+    with c2:
+        cls_hour = st.slider("⏰ Hour of Day", 0, 23,
+                             value=get_ist_now().hour, key="cls_hour")
+
+    c3, c4, c5 = st.columns(3)
+    with c3:
+        cls_dow = st.selectbox("📅 Day", ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"],
+                               key="cls_dow")
+        dow_map = {"Mon":0,"Tue":1,"Wed":2,"Thu":3,"Fri":4,"Sat":5,"Sun":6}
+        cls_dow_int = dow_map[cls_dow]
+    with c4:
+        cls_month = st.selectbox("📆 Month", list(range(1,13)),
+                                 format_func=lambda m: datetime(2024,m,1).strftime("%B"),
+                                 index=get_ist_now().month - 1, key="cls_month")
+    with c5:
+        cls_rain = int(st.toggle("🌧️ Rain", key="cls_rain"))
+
+    cls_matches = find_stop(cls_stop_input) if cls_stop_input else []
+    cls_stop = None
+    if cls_matches:
+        cls_stop = st.selectbox("Select stop:", cls_matches, key="cls_sel")
+    elif cls_stop_input:
+        st.warning("Stop not found — try a different name.")
+
+    if st.button("🧠 Classify Delay", type="primary", use_container_width=True, key="cls_btn"):
+        if not cls_stop:
+            st.error("Please select a valid stop first.")
+        else:
+            X_cls, s_cls = build_features(cls_stop, cls_hour, cls_dow_int, cls_month, cls_rain)
+            if X_cls is None:
+                st.error("Feature build failed — stop not in stop_summary.")
+            else:
+                raw_delay = float(np.clip(xgb_model.predict(X_cls)[0], 0, None))
+
+                # ── Classify ──────────────────────────────────────────────────
+                # Thresholds: <3 min = On-Time, 3–8 = Minor, ≥8 = Major
+                if raw_delay < 3:
+                    cls_label = "✅ On-Time"
+                    cls_color = "#065F46"; cls_bg = "#D1FAE5"
+                    # Soft-probability: triangle distribution around 0
+                    p_ontime = max(0.0, min(1.0, 1.0 - raw_delay / 3.0))
+                    p_minor  = 1.0 - p_ontime
+                    p_major  = 0.0
+                elif raw_delay < 8:
+                    cls_label = "⚠️ Minor Delay"
+                    cls_color = "#92400E"; cls_bg = "#FEF3C7"
+                    t = (raw_delay - 3) / 5.0          # 0→1 across [3,8]
+                    p_minor  = max(0.4, 1.0 - abs(t - 0.5))
+                    p_ontime = max(0.0, 0.5 - t * 0.5)
+                    p_major  = max(0.0, t * 0.5)
+                    total    = p_ontime + p_minor + p_major
+                    p_ontime /= total; p_minor /= total; p_major /= total
+                else:
+                    cls_label = "🔴 Major Delay"
+                    cls_color = "#991B1B"; cls_bg = "#FEE2E2"
+                    p_major  = min(1.0, 0.5 + (raw_delay - 8) / 20.0)
+                    p_minor  = 1.0 - p_major
+                    p_ontime = 0.0
+
+                # ── Feature importance / impact ────────────────────────────────
+                feat_vals = X_cls.iloc[0].to_dict()
+                # Rank features by absolute value × model feature importance
+                try:
+                    fi = dict(zip(FEATURES, xgb_model.feature_importances_))
+                    impact = {f: abs(feat_vals.get(f, 0)) * fi.get(f, 0) for f in FEATURES}
+                    top_feats = sorted(impact.items(), key=lambda x: x[1], reverse=True)[:6]
+                except Exception:
+                    top_feats = []
+
+                # ── Render result ─────────────────────────────────────────────
+                import streamlit.components.v1 as components
+
+                prob_bar = lambda p, col, lbl: (
+                    f'<div style="margin:6px 0">'
+                    f'<div style="display:flex;justify-content:space-between;'
+                    f'font-size:0.8rem;margin-bottom:2px">'
+                    f'<span>{lbl}</span><span>{p*100:.1f}%</span></div>'
+                    f'<div style="background:#E5E7EB;border-radius:4px;height:10px">'
+                    f'<div style="background:{col};width:{p*100:.1f}%;height:10px;'
+                    f'border-radius:4px"></div></div></div>'
+                )
+
+                feat_rows = ""
+                feat_colors = {
+                    "is_rain":"#3B82F6","is_rush":"#EF4444","hour":"#F59E0B",
+                    "factor":"#8B5CF6","trip_count":"#06B6D4","route_count":"#10B981",
+                }
+                for fn, fv in top_feats:
+                    disp = fn.replace("_"," ").title()
+                    raw_v = feat_vals.get(fn, 0)
+                    fc = feat_colors.get(fn, "#6B7280")
+                    feat_rows += (
+                        f'<tr><td style="padding:4px 8px;font-size:0.8rem">{disp}</td>'
+                        f'<td style="padding:4px 8px;font-size:0.8rem;text-align:right">'
+                        f'<span style="background:{fc}22;color:{fc};padding:2px 6px;'
+                        f'border-radius:4px;font-weight:600">{raw_v:.3f}</span></td></tr>'
+                    )
+
+                rush_tag = ""
+                if cls_hour in [7,8,9]:   rush_tag = "🔴 AM Rush"
+                elif cls_hour in [17,18,19]: rush_tag = "🔴 PM Rush"
+                rain_tag = "🌧️ Rain" if cls_rain else "☀️ Clear"
+
+                html = f"""
+<html><head><meta charset="utf-8">
+<style>
+  body{{margin:0;padding:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}}
+  .wrap{{background:#fff;border:1px solid #E2E8F0;border-radius:14px;padding:22px 24px;
+          box-shadow:0 2px 12px rgba(0,0,0,.07)}}
+  .badge{{display:inline-block;padding:6px 16px;border-radius:8px;
+           font-weight:800;font-size:1.1rem;margin-bottom:12px}}
+  .grid{{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:14px}}
+  .box{{background:#F8FAFC;border:1px solid #E2E8F0;border-radius:10px;padding:14px}}
+  .box h4{{margin:0 0 10px 0;font-size:0.85rem;color:#64748B;font-weight:700;
+            text-transform:uppercase;letter-spacing:.06em}}
+  table{{width:100%;border-collapse:collapse}}
+</style></head><body>
+<div class="wrap">
+  <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+    <div class="badge" style="background:{cls_bg};color:{cls_color}">{cls_label}</div>
+    <span style="font-size:0.85rem;color:#64748B">
+      {cls_stop} &nbsp;·&nbsp; {cls_hour:02d}:00 &nbsp;·&nbsp; {cls_dow} &nbsp;·&nbsp;
+      {datetime(2024,cls_month,1).strftime('%B')} &nbsp;·&nbsp; {rain_tag}
+      {"&nbsp;·&nbsp;" + rush_tag if rush_tag else ""}
+    </span>
+  </div>
+  <p style="font-size:1.6rem;font-weight:800;color:{cls_color};margin:8px 0 0 0">
+    {raw_delay:.1f} min <span style="font-size:1rem;font-weight:400">predicted delay</span>
+  </p>
+
+  <div class="grid">
+    <div class="box">
+      <h4>Class Probabilities</h4>
+      {prob_bar(p_ontime,"#10B981","✅ On-Time")}
+      {prob_bar(p_minor, "#F59E0B","⚠️ Minor Delay")}
+      {prob_bar(p_major, "#EF4444","🔴 Major Delay")}
+    </div>
+    <div class="box">
+      <h4>Top Feature Drivers</h4>
+      <table>{feat_rows}</table>
+    </div>
+  </div>
+</div>
+</body></html>"""
+                components.html(html, height=310, scrolling=False)
+
+                # ── Multi-stop batch classification ───────────────────────────
+                st.markdown("#### Compare Multiple Stops at This Time")
+                st.caption("Top 10 most-delayed vs top 10 best-performing stops right now")
+
+                sample_stops = stop_summary.nlargest(10,"avg_delay")["stop_name"].tolist() + \
+                               stop_summary.nsmallest(10,"avg_delay")["stop_name"].tolist()
+                batch_rows = []
+                for sn in sample_stops:
+                    d = predict_delay(sn, cls_hour, cls_dow_int, cls_month, cls_rain)
+                    lbl = "On-Time" if d < 3 else ("Minor Delay" if d < 8 else "Major Delay")
+                    batch_rows.append({"Stop": sn, "Predicted Delay (min)": d, "Class": lbl})
+
+                bdf = pd.DataFrame(batch_rows).sort_values("Predicted Delay (min)", ascending=False)
+
+                fig_b, ax_b = plt.subplots(figsize=(10, 5))
+                colors_b = ["#EF4444" if c=="Major Delay" else
+                            "#F59E0B" if c=="Minor Delay" else "#10B981"
+                            for c in bdf["Class"]]
+                ax_b.barh(bdf["Stop"].str[:30], bdf["Predicted Delay (min)"],
+                          color=colors_b, edgecolor="white")
+                ax_b.axvline(3, color="#F59E0B", ls="--", lw=1.2, label="Minor threshold (3 min)")
+                ax_b.axvline(8, color="#EF4444", ls="--", lw=1.2, label="Major threshold (8 min)")
+                ax_b.set_xlabel("Predicted Delay (min)")
+                ax_b.set_title(f"Delay Classification — {cls_hour:02d}:00 · {cls_dow} · "
+                               f"{'Rain' if cls_rain else 'Clear'}")
+                ax_b.legend(fontsize=8)
+                ax_b.grid(axis="x", alpha=0.3)
+                plt.tight_layout()
+                st.pyplot(fig_b)
+                plt.close()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 4 — ADMIN DASHBOARD
+# ══════════════════════════════════════════════════════════════════════════════
+with tab4:
+    import streamlit.components.v1 as components
+
+    st.subheader("🛠️ Admin Dashboard — Network Overview")
+    st.markdown(
+        "System-wide analytics derived from the trained model and stop metadata. "
+        "No external data source required — all computed on-the-fly."
+    )
+    st.markdown("---")
+
+    # ── Admin password gate ───────────────────────────────────────────────────
+    _ADMIN_PW = "bmtc2024"
+    if "admin_unlocked" not in st.session_state:
+        st.session_state["admin_unlocked"] = False
+
+    if not st.session_state["admin_unlocked"]:
+        pw = st.text_input("🔒 Enter Admin Password", type="password", key="admin_pw")
+        if st.button("Unlock Dashboard", key="admin_unlock_btn"):
+            if pw == _ADMIN_PW:
+                st.session_state["admin_unlocked"] = True
+                st.rerun()
+            else:
+                st.error("Incorrect password.")
+        st.caption("Default password: `bmtc2024`  — change `_ADMIN_PW` in app.py")
+        st.stop()
+
+    # ── Controls ──────────────────────────────────────────────────────────────
+    adm_col1, adm_col2, adm_col3 = st.columns(3)
+    with adm_col1:
+        adm_hour  = st.slider("⏰ Analysis Hour", 0, 23, value=8, key="adm_h")
+    with adm_col2:
+        adm_dow   = st.selectbox("📅 Day", ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"],
+                                  key="adm_dow")
+        adm_dow_i = {"Mon":0,"Tue":1,"Wed":2,"Thu":3,"Fri":4,"Sat":5,"Sun":6}[adm_dow]
+    with adm_col3:
+        adm_rain  = int(st.toggle("🌧️ Rain scenario", key="adm_rain"))
+
+    adm_month = get_ist_now().month   # always current month
+
+    # ── Compute network-wide predictions ─────────────────────────────────────
+    @st.cache_data(ttl=300, show_spinner=False)
+    def _network_predictions(hour: int, dow: int, month: int, rain: int) -> pd.DataFrame:
+        rows = []
+        for _, row in stop_summary.iterrows():
+            sn = row["stop_name"]
+            d  = predict_delay(sn, hour, dow, month, rain)
+            lbl = "On-Time" if d < 3 else ("Minor" if d < 8 else "Major")
+            rows.append({
+                "stop_name"   : sn,
+                "delay_min"   : d,
+                "class"       : lbl,
+                "avg_delay"   : float(row["avg_delay"]),
+                "trip_count"  : int(row["trip_count"]),
+                "route_count" : int(row["route_count"]),
+            })
+        return pd.DataFrame(rows)
+
+    with st.spinner("Computing network predictions..."):
+        net = _network_predictions(adm_hour, adm_dow_i, adm_month, adm_rain)
+
+    n_total  = len(net)
+    n_ontime = (net["class"] == "On-Time").sum()
+    n_minor  = (net["class"] == "Minor").sum()
+    n_major  = (net["class"] == "Major").sum()
+    avg_net  = net["delay_min"].mean()
+    max_net  = net["delay_min"].max()
+
+    # ── KPI row ───────────────────────────────────────────────────────────────
+    kpi_html = f"""
+<html><head><meta charset="utf-8">
+<style>
+  body{{margin:0;padding:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}}
+  .row{{display:grid;grid-template-columns:repeat(5,1fr);gap:12px}}
+  .kpi{{background:#fff;border:1px solid #E2E8F0;border-radius:12px;
+         padding:16px 18px;box-shadow:0 1px 6px rgba(0,0,0,.05);text-align:center}}
+  .kpi .val{{font-size:1.9rem;font-weight:800;line-height:1}}
+  .kpi .lbl{{font-size:0.72rem;color:#64748B;margin-top:4px;font-weight:600;
+              text-transform:uppercase;letter-spacing:.05em}}
+</style></head><body>
+<div class="row">
+  <div class="kpi">
+    <div class="val" style="color:#1A3A5C">{n_total:,}</div>
+    <div class="lbl">Total Stops</div>
+  </div>
+  <div class="kpi">
+    <div class="val" style="color:#10B981">{n_ontime:,}</div>
+    <div class="lbl">✅ On-Time</div>
+  </div>
+  <div class="kpi">
+    <div class="val" style="color:#F59E0B">{n_minor:,}</div>
+    <div class="lbl">⚠️ Minor Delay</div>
+  </div>
+  <div class="kpi">
+    <div class="val" style="color:#EF4444">{n_major:,}</div>
+    <div class="lbl">🔴 Major Delay</div>
+  </div>
+  <div class="kpi">
+    <div class="val" style="color:#6366F1">{avg_net:.1f} min</div>
+    <div class="lbl">Avg Network Delay</div>
+  </div>
+</div>
+</body></html>"""
+    components.html(kpi_html, height=110)
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── Row 1: Delay distribution + class pie ─────────────────────────────────
+    r1c1, r1c2 = st.columns(2)
+
+    with r1c1:
+        st.markdown("#### Delay Distribution")
+        fig1, ax1 = plt.subplots(figsize=(5, 3))
+        ax1.hist(net["delay_min"], bins=40, color="#3B82F6", edgecolor="white", alpha=0.85)
+        ax1.axvline(3, color="#F59E0B", ls="--", lw=1.5, label="Minor (3 min)")
+        ax1.axvline(8, color="#EF4444", ls="--", lw=1.5, label="Major (8 min)")
+        ax1.set_xlabel("Predicted Delay (min)")
+        ax1.set_ylabel("Number of Stops")
+        ax1.set_title(f"{adm_hour:02d}:00 · {adm_dow} · {'Rain' if adm_rain else 'Clear'}")
+        ax1.legend(fontsize=8)
+        ax1.grid(alpha=0.3)
+        plt.tight_layout()
+        st.pyplot(fig1); plt.close()
+
+    with r1c2:
+        st.markdown("#### Network Status Breakdown")
+        fig2, ax2 = plt.subplots(figsize=(4, 3))
+        sizes  = [n_ontime, n_minor, n_major]
+        labels = [f"On-Time\n{n_ontime}", f"Minor\n{n_minor}", f"Major\n{n_major}"]
+        colors = ["#10B981", "#F59E0B", "#EF4444"]
+        explode = [0.04, 0.04, 0.08]
+        wedges, texts, autotexts = ax2.pie(
+            sizes, labels=labels, colors=colors, explode=explode,
+            autopct="%1.1f%%", startangle=120,
+            textprops={"fontsize": 8}, pctdistance=0.78,
+        )
+        for at in autotexts:
+            at.set_fontsize(8); at.set_color("white"); at.set_fontweight("bold")
+        ax2.set_title("Status Distribution", fontsize=9)
+        plt.tight_layout()
+        st.pyplot(fig2); plt.close()
+
+    # ── Row 2: Worst / Best stops ─────────────────────────────────────────────
+    r2c1, r2c2 = st.columns(2)
+
+    with r2c1:
+        st.markdown("#### 🔴 Top 15 Worst Stops")
+        worst = net.nlargest(15, "delay_min")[["stop_name", "delay_min", "class"]]
+        fig3, ax3 = plt.subplots(figsize=(5, 4.5))
+        bar_colors = ["#EF4444" if c == "Major" else "#F59E0B" for c in worst["class"]]
+        ax3.barh(worst["stop_name"].str[:28], worst["delay_min"],
+                 color=bar_colors, edgecolor="white")
+        ax3.set_xlabel("Predicted Delay (min)")
+        ax3.set_title("Worst Stops — Current Scenario")
+        ax3.grid(axis="x", alpha=0.3)
+        plt.tight_layout()
+        st.pyplot(fig3); plt.close()
+
+    with r2c2:
+        st.markdown("#### ✅ Top 15 Best Stops")
+        best = net.nsmallest(15, "delay_min")[["stop_name", "delay_min", "class"]]
+        fig4, ax4 = plt.subplots(figsize=(5, 4.5))
+        ax4.barh(best["stop_name"].str[:28], best["delay_min"],
+                 color="#10B981", edgecolor="white")
+        ax4.set_xlabel("Predicted Delay (min)")
+        ax4.set_title("Best Stops — Current Scenario")
+        ax4.grid(axis="x", alpha=0.3)
+        plt.tight_layout()
+        st.pyplot(fig4); plt.close()
+
+    # ── Row 3: 24-hr heatmap by hour & class ──────────────────────────────────
+    st.markdown("#### ⏱️ Network-Wide Hourly Delay Heatmap")
+    st.caption("Average predicted delay per hour across all stops · current day/month/rain setting")
+
+    @st.cache_data(ttl=600, show_spinner=False)
+    def _hourly_heatmap(dow: int, month: int, rain: int) -> np.ndarray:
+        """Returns shape (n_stops, 24) matrix of predicted delays."""
+        stops_list = stop_summary["stop_name"].tolist()
+        mat = np.zeros((len(stops_list), 24))
+        for h in range(24):
+            for i, sn in enumerate(stops_list):
+                mat[i, h] = predict_delay(sn, h, dow, month, rain)
+        return mat, stops_list
+
+    with st.spinner("Building hourly heatmap (runs once per scenario)..."):
+        mat, stops_list = _hourly_heatmap(adm_dow_i, adm_month, adm_rain)
+
+    hourly_avg = mat.mean(axis=0)   # shape (24,)
+    hourly_pct_major = (mat >= 8).mean(axis=0) * 100  # % stops in major delay per hour
+
+    fig5, (ax5a, ax5b) = plt.subplots(2, 1, figsize=(10, 5), sharex=True)
+    ax5a.plot(range(24), hourly_avg, color="#3B82F6", lw=2.5, marker="o", markersize=4)
+    ax5a.axhline(3, color="#F59E0B", ls="--", lw=1.2)
+    ax5a.axhline(8, color="#EF4444", ls="--", lw=1.2)
+    ax5a.axvspan(7, 9,  alpha=0.10, color="red")
+    ax5a.axvspan(17, 19, alpha=0.10, color="orange")
+    ax5a.set_ylabel("Avg Delay (min)")
+    ax5a.set_title(f"Network Hourly Profile — {adm_dow} · "
+                   f"{'Rain' if adm_rain else 'Clear'}")
+    ax5a.grid(alpha=0.3)
+
+    ax5b.fill_between(range(24), hourly_pct_major, color="#EF4444", alpha=0.5)
+    ax5b.plot(range(24), hourly_pct_major, color="#EF4444", lw=1.5)
+    ax5b.set_ylabel("% Stops Major Delay")
+    ax5b.set_xlabel("Hour of Day")
+    ax5b.set_xticks(range(0, 24, 2))
+    ax5b.grid(alpha=0.3)
+
+    plt.tight_layout()
+    st.pyplot(fig5); plt.close()
+
+    # ── Row 4: Rain impact analysis ───────────────────────────────────────────
+    st.markdown("#### 🌧️ Rain Impact Analysis")
+    st.caption("Comparing dry vs rainy scenario for the selected hour across all stops")
+
+    @st.cache_data(ttl=600, show_spinner=False)
+    def _rain_delta(hour: int, dow: int, month: int) -> pd.DataFrame:
+        rows = []
+        for _, row in stop_summary.iterrows():
+            sn   = row["stop_name"]
+            d_dry  = predict_delay(sn, hour, dow, month, 0)
+            d_rain = predict_delay(sn, hour, dow, month, 1)
+            rows.append({"stop": sn, "dry": d_dry, "rain": d_rain,
+                         "delta": d_rain - d_dry,
+                         "trip_count": int(row["trip_count"])})
+        return pd.DataFrame(rows)
+
+    with st.spinner("Computing rain delta..."):
+        rain_df = _rain_delta(adm_hour, adm_dow_i, adm_month)
+
+    rc1, rc2 = st.columns(2)
+    with rc1:
+        avg_dry  = rain_df["dry"].mean()
+        avg_rain = rain_df["rain"].mean()
+        fig6, ax6 = plt.subplots(figsize=(5, 3))
+        ax6.bar(["☀️ Dry", "🌧️ Rain"], [avg_dry, avg_rain],
+                color=["#3B82F6", "#6366F1"], edgecolor="white", width=0.5)
+        ax6.set_ylabel("Avg Delay (min)")
+        ax6.set_title(f"Rain Effect · {adm_hour:02d}:00 · {adm_dow}")
+        for i, v in enumerate([avg_dry, avg_rain]):
+            ax6.text(i, v + 0.1, f"{v:.2f}", ha="center", fontsize=9, fontweight="bold")
+        ax6.grid(axis="y", alpha=0.3)
+        plt.tight_layout()
+        st.pyplot(fig6); plt.close()
+
+    with rc2:
+        top_rain_impact = rain_df.nlargest(10, "delta")[["stop", "delta"]]
+        fig7, ax7 = plt.subplots(figsize=(5, 3))
+        ax7.barh(top_rain_impact["stop"].str[:28], top_rain_impact["delta"],
+                 color="#6366F1", edgecolor="white")
+        ax7.set_xlabel("Extra Delay in Rain (min)")
+        ax7.set_title("Stops Most Affected by Rain")
+        ax7.grid(axis="x", alpha=0.3)
+        plt.tight_layout()
+        st.pyplot(fig7); plt.close()
+
+    # ── Row 5: Stop Audit Table ────────────────────────────────────────────────
+    st.markdown("#### 🔎 Full Stop Audit")
+    audit_search = st.text_input("Filter stops by name:", key="audit_search")
+    audit_df = net.copy()
+    audit_df.columns = ["Stop Name", "Predicted Delay (min)", "Severity Class",
+                        "Hist. Avg Delay", "Trip Count", "Route Count"]
+    if audit_search:
+        audit_df = audit_df[audit_df["Stop Name"].str.contains(
+            audit_search, case=False, na=False)]
+
+    # Colour-code the class column
+    def _highlight_class(val):
+        if val == "Major":   return "background-color:#FEE2E2;color:#991B1B;font-weight:700"
+        if val == "Minor":   return "background-color:#FEF3C7;color:#92400E;font-weight:700"
+        return "background-color:#D1FAE5;color:#065F46;font-weight:700"
+
+    styled = (
+        audit_df.sort_values("Predicted Delay (min)", ascending=False)
+        .reset_index(drop=True)
+        .style
+        .applymap(_highlight_class, subset=["Severity Class"])
+        .format({"Predicted Delay (min)": "{:.1f}", "Hist. Avg Delay": "{:.2f}"})
+    )
+    st.dataframe(styled, use_container_width=True, height=400)
+
+    csv_bytes = audit_df.to_csv(index=False).encode()
+    st.download_button(
+        "⬇️ Download Audit CSV",
+        data=csv_bytes,
+        file_name=f"bmtc_audit_{adm_dow}_{adm_hour:02d}h_"
+                  f"{'rain' if adm_rain else 'dry'}.csv",
+        mime="text/csv",
+        key="audit_dl",
+    )
+
+    # ── Row 6: Scenario Comparison ─────────────────────────────────────────────
+    st.markdown("#### 📊 Scenario Comparison (Rush Hour vs Off-Peak)")
+    sc1, sc2 = st.columns(2)
+    with sc1:
+        st.caption("AM Rush — 08:00 Monday, Rain")
+        rush_preds = [predict_delay(s, 8, 0, adm_month, 1)
+                      for s in stop_summary["stop_name"]]
+        st.metric("Avg Delay", f"{np.mean(rush_preds):.2f} min")
+        st.metric("% Major Delay Stops",
+                  f"{100*sum(d>=8 for d in rush_preds)/len(rush_preds):.1f}%")
+    with sc2:
+        st.caption("Off-Peak — 14:00 Wednesday, Clear")
+        offpeak_preds = [predict_delay(s, 14, 2, adm_month, 0)
+                         for s in stop_summary["stop_name"]]
+        st.metric("Avg Delay", f"{np.mean(offpeak_preds):.2f} min")
+        st.metric("% Major Delay Stops",
+                  f"{100*sum(d>=8 for d in offpeak_preds)/len(offpeak_preds):.1f}%")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 5 — ABOUT
+# ══════════════════════════════════════════════════════════════════════════════
+with tab5:
     st.subheader("About This Project")
 
     n_stops   = metadata.get("n_stops", "~1,955")
@@ -888,10 +1399,12 @@ with tab3:
     st.markdown(f"""
     **Project:** Real-Time Public Transport Delay Prediction — Bengaluru
 
-    **Domain:** Machine Learning | Time-Series Forecasting | Regression
+    **Domain:** Machine Learning | Time-Series Forecasting | Regression | Classification
 
     **Dataset:** BMTC GTFS Aggregated Data (4,655 real Bengaluru bus stops
     with trip counts, route counts, and GPS coordinates)
+
+    **Team:** 2-Member Project · 300 Marks
 
     ---
 
@@ -900,6 +1413,7 @@ with tab3:
     | Model | Type | Scope | Purpose |
     |---|---|---|---|
     | **XGBoost** | ML Regression | All {n_stops:,} stops | Live delay prediction (primary) |
+    | **Delay Classifier** | Rule-based + ML | All stops | 3-class delay severity label |
     | LSTM (Bi-directional) | Deep Learning | Busiest stop | Academic comparison |
     | ARIMA | Statistical | Busiest stop | Time-series baseline |
     | SARIMA | Statistical | Busiest stop | Seasonal time-series baseline |
@@ -907,12 +1421,12 @@ with tab3:
 
     ---
 
-    #### Real-Time Features
-    - 🌦️ **Live weather** — OpenWeatherMap API fetches current Bengaluru
-      rain status every 10 minutes and auto-sets the rain toggle
-    - 🕐 **Current time default** — time selector defaults to current
-      Bengaluru IST time (Asia/Kolkata timezone), rounded to nearest 30 min
-    - 📅 **Calendar date picker** — day and month extracted automatically
+    #### New Features (v2)
+    - 🧠 **Delay Classifier** — classifies each corridor prediction into On-Time / Minor Delay / Major Delay with probability breakdown and feature impact
+    - 🛠️ **Admin Dashboard** — network-level KPIs, worst/best stop heatmaps, delay distribution, hourly heatmap, rain impact analysis, batch stop audit
+    - 🌦️ **Live weather** — OpenWeatherMap API, auto-sets rain toggle every 10 min
+    - 🕐 **Current IST time default** — rounds to nearest 30-min slot
+    - 🗺️ **GTFS bus lookup** — proper stop→trip→route join on BMTC GTFS data
 
     ---
 
@@ -921,10 +1435,10 @@ with tab3:
     2. Travel date selected from calendar (past dates hidden)
     3. Time selected from 30-min slots — defaults to current IST time
     4. Rain status auto-detected from live weather API (overrideable)
-    5. **XGBoost** predicts delay using 19 features
-    6. Bus numbers looked up from route database
-    7. If stop is in top {n_prophet} high-delay stops, **Prophet**
-       provides a 24-hour forecast curve with confidence band
+    5. **XGBoost** predicts delay (minutes) using 19 engineered features
+    6. **Delay Classifier** maps delay → severity class + confidence
+    7. Bus numbers looked up from BMTC GTFS join (stops→trips→routes)
+    8. If stop is in top {n_prophet} high-delay stops, **Prophet** adds 24-hr forecast
 
     ---
 
@@ -937,6 +1451,6 @@ with tab3:
 st.markdown("""
     <hr>
     <p style='text-align:center;color:gray;font-size:0.8em'>
-    BMTC Delay Prediction · Bengaluru
+    BMTC Delay Prediction · Bengaluru · v2.0
     </p>
 """, unsafe_allow_html=True)
