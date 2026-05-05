@@ -17,6 +17,137 @@ import pytz
 import warnings
 warnings.filterwarnings('ignore')
 
+if "user" not in st.session_state:
+    st.session_state.user = None
+
+if "history" not in st.session_state:
+    st.session_state.history = []
+
+if "favorites" not in st.session_state:
+    st.session_state.favorites = []
+
+# ---------------- USER AUTH SYSTEM ----------------
+USERS_FILE = "users.json"
+
+def load_users():
+    if os.path.exists(USERS_FILE):
+        return json.load(open(USERS_FILE))
+    return {}
+
+def save_users(users):
+    json.dump(users, open(USERS_FILE, "w"))
+
+def login(username, password):
+    users = load_users()
+    if username in users and users[username] == password:
+        st.session_state.user = username
+        return True
+    return False
+
+def signup(username, password):
+    users = load_users()
+    users[username] = password
+    save_users(users)
+
+# ---------------- LOGIN UI ----------------
+if not st.session_state.user:
+    st.title("🔐 Login to BMTC Smart App")
+
+    tab1, tab2 = st.tabs(["Login", "Signup"])
+
+    with tab1:
+        u = st.text_input("Username")
+        p = st.text_input("Password", type="password")
+
+        if st.button("Login"):
+            if login(u, p):
+                st.success("Logged in successfully!")
+                st.rerun()
+            else:
+                st.error("Invalid credentials")
+
+    with tab2:
+        new_u = st.text_input("New Username")
+        new_p = st.text_input("New Password", type="password")
+
+        if st.button("Signup"):
+            signup(new_u, new_p)
+            st.success("Account created! Please login.")
+
+    st.stop()
+
+# ---------------- HEADER ----------------
+st.title(f"🚌 Welcome {st.session_state.user}")
+
+# ---------------- EXISTING MODEL FUNCTIONS ----------------
+# (Keep ALL your original ML + GTFS code here unchanged)
+
+def predict_delay_stub():
+    return np.random.randint(1, 15)
+
+# ---------------- ETA CALCULATION ----------------
+def calculate_eta(delay, base_time=30):
+    return base_time + delay
+
+# ---------------- MAIN TABS ----------------
+tab1, tab2, tab3, tab4 = st.tabs([
+    "🔍 Predict",
+    "⭐ Favorites",
+    "📜 History",
+    "👤 Profile"
+])
+
+# ==========================================================
+# TAB 1 — PREDICTION (ENHANCED)
+# ==========================================================
+with tab1:
+    st.subheader("Plan Your Journey")
+
+    src = st.text_input("From")
+    dst = st.text_input("To")
+
+    if st.button("Predict Journey"):
+        delay = predict_delay_stub()
+        eta = calculate_eta(delay)
+
+        st.success(f"Predicted Delay: {delay} min")
+        st.info(f"Estimated Travel Time (ETA): {eta} min")
+
+        # SAVE HISTORY
+        st.session_state.history.append({
+            "from": src,
+            "to": dst,
+            "delay": delay,
+            "eta": eta,
+            "time": str(datetime.now())
+        })
+
+        # ADD TO FAVORITES
+        if st.button("⭐ Add to Favorites"):
+            st.session_state.favorites.append({
+                "from": src,
+                "to": dst
+            })
+            st.success("Added to favorites!")
+
+with tab2:
+    st.subheader("⭐ Your Favorite Routes")
+
+    if not st.session_state.favorites:
+        st.info("No favorites yet")
+    else:
+        for fav in st.session_state.favorites:
+            col1, col2 = st.columns([3,1])
+
+            with col1:
+                st.write(f"📍 {fav['from']} → {fav['to']}")
+
+            with col2:
+                if st.button("Use", key=f"{fav['from']}_{fav['to']}"):
+                    st.session_state.selected_fav = fav
+                    st.success("Loaded into predictor!")
+
+
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="BMTC Delay Predictor",
@@ -160,6 +291,17 @@ def find_stop(query, n=6):
     fuzzy = get_close_matches(query, [s.lower() for s in all_stops],
                               n=n, cutoff=0.4)
     return [s for s in all_stops if s.lower() in fuzzy]
+
+# TAB 3 — HISTORY
+# ==========================================================
+with tab3:
+    st.subheader("📜 Travel History")
+
+    if not st.session_state.history:
+        st.info("No history yet")
+    else:
+        df = pd.DataFrame(st.session_state.history)
+        st.dataframe(df)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # BUS NUMBER LOOKUP  —  GTFS proper join pipeline
@@ -1386,6 +1528,22 @@ with tab4:
         st.metric("Avg Delay", f"{np.mean(offpeak_preds):.2f} min")
         st.metric("% Major Delay Stops",
                   f"{100*sum(d>=8 for d in offpeak_preds)/len(offpeak_preds):.1f}%")
+
+
+
+# TAB 4 — PROFILE
+# ==========================================================
+with tab4:
+    st.subheader("👤 User Profile")
+
+    st.write(f"Logged in as: {st.session_state.user}")
+
+    if st.button("Logout"):
+        st.session_state.user = None
+        st.rerun()
+
+
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 5 — ABOUT
