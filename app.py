@@ -79,16 +79,15 @@ def register_user(email: str, password: str, name: str):
     try:
         user = auth.create_user_with_email_and_password(email, password)
 
-        # Store user profile in Firestore
         db.collection("users").document(user["localId"]).set({
             "name": name,
             "email": email
         })
 
         return True, "Account created successfully!"
-    except:
-        return False, "Signup failed. Email may already exist."
 
+    except Exception as e:
+        return False, str(e)   
 
 def login_user(email: str, password: str):
     try:
