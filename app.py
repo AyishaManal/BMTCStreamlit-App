@@ -880,10 +880,10 @@ with tab1:
             with fav_col2:
                 st.markdown("<br>", unsafe_allow_html=True)
                 if st.button("⭐ Save Favourite"):
-    st.write("Button clicked")  # DEBUG
+                    st.write("Button clicked")  # DEBUG
 
-    ok = add_favourite(CUR_USER_ID, label, from_stop, to_stop)
-    st.write("Result:", ok)
+                    ok = add_favourite(CUR_USER_ID, label, from_stop, to_stop)
+                    st.write("Result:", ok)
 
             # ── Leaflet Map ────────────────────────────────────────────────────
             st.markdown("#### 🗺️ Route Map")
