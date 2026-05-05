@@ -61,7 +61,11 @@ auth = firebase.auth()
 
 # Initialize Firestore (server-side DB)
 if not firebase_admin._apps:
-    cred = credentials.Certificate(dict(st.secrets["firebase_admin"]))
+    
+# Fix newline issue explicitly
+     firebase_admin_config["private_key"] = firebase_admin_config["private_key"].replace("\\n", "\n")
+
+     cred = credentials.Certificate(firebase_admin_config)
     firebase_admin.initialize_app(cred)
 
 db = firestore.client()
