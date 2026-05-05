@@ -23,7 +23,6 @@ import pyrebase
 import firebase_admin
 from firebase_admin import credentials, firestore
 
-
 # ── Paths ─────────────────────────────────────────────────────────────────────
 MODEL_DIR  = "models"
 OUTPUT_DIR = "outputs"
@@ -42,17 +41,8 @@ except (KeyError, FileNotFoundError):
     OWM_API_KEY = ""
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DATABASE SETUP
-# ══════════════════════════════════════════════════════════════════════════════
-
-# ══════════════════════════════════════════════════════════════════════════════
 # FIREBASE SETUP
 # ══════════════════════════════════════════════════════════════════════════════
-
-import streamlit as st
-import pyrebase
-import firebase_admin
-from firebase_admin import credentials, firestore
 
 # Initialize Firebase Auth (client-side)
 firebase_config = dict(st.secrets["firebase"])
@@ -112,24 +102,21 @@ def login_user(email: str, password: str):
 
 def add_favourite(user_id, label, from_stop, to_stop):
     try:
-        doc_ref = db.collection("favorites").add({
-            "user_id": user_id,
-            "label": label,
+        _ts, doc_ref = db.collection("favorites").add({
+            "user_id"  : user_id,
+            "label"    : label,
             "from_stop": from_stop,
-            "to_stop": to_stop,
-            "added": firestore.SERVER_TIMESTAMP
+            "to_stop"  : to_stop,
+            "added"    : firestore.SERVER_TIMESTAMP,
         })
-
-        print("Saved doc:", doc_ref)  # server log
         return True
-
     except Exception as e:
         st.error(f"Error saving favourite: {e}")
         return False
 
 
 def get_favourites(user_id):
-    docs = db.collection("favorites").where("user_id", "==", user_id).stream()
+    docs = db.collection("favorites").where(filter=firestore.FieldFilter("user_id", "==", user_id)).stream()
     return [doc.to_dict() | {"id": doc.id} for doc in docs]
 
 
@@ -158,7 +145,7 @@ def save_history(user_id, from_stop, to_stop, travel_date, travel_time,
 
 def get_history(user_id, limit=30):
     docs = db.collection("travel_history") \
-        .where("user_id", "==", user_id) \
+        .where(filter=firestore.FieldFilter("user_id", "==", user_id)) \
         .stream()
 
     data = [doc.to_dict() for doc in docs]
@@ -871,23 +858,24 @@ with tab1:
                          selected_label, src_delay, dst_delay, is_rain)
 
             # ── Save to Favourites ─────────────────────────────────────────────
-            st.write("User ID:", CUR_USER_ID)
             st.markdown("#### ⭐ Save This Route")
             fav_col1, fav_col2 = st.columns([3, 1])
             with fav_col1:
-                fav_label = st.text_input("Label for this route (optional)",
-                                          placeholder=f"{src_stop} → {dst_stop}",
-                                          key="fav_label_input")
+                fav_label = st.text_input(
+                    "Label for this route (optional)",
+                    placeholder=f"{src_stop} → {dst_stop}",
+                    key="fav_label_input",
+                )
             with fav_col2:
                 st.markdown("<br>", unsafe_allow_html=True)
-                if st.button("⭐ Save Favourite"):
-                    ok = add_favourite(CUR_USER_ID, label, from_stop, to_stop)
-
+                if st.button("⭐ Save Favourite", key="save_fav_btn"):
+                    resolved_label = fav_label.strip() or f"{src_stop} → {dst_stop}"
+                    ok = add_favourite(CUR_USER_ID, resolved_label, src_stop, dst_stop)
                     if ok:
-                      st.success("Saved to favourites!")
-                      st.rerun()
+                        st.success(f"✅ '{resolved_label}' saved to favourites!")
+                        st.rerun()
                     else:
-                      st.error("Failed to save")
+                        st.error("❌ Failed to save favourite — check Firestore rules.")
 
             # ── Leaflet Map ────────────────────────────────────────────────────
             st.markdown("#### 🗺️ Route Map")
