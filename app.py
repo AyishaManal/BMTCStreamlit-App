@@ -876,10 +876,12 @@ with tab1:
                                           key="fav_label_input")
             with fav_col2:
                 st.markdown("<br>", unsafe_allow_html=True)
-                if st.button("⭐ Save Favourite", key="save_fav_btn"):
-                    label = fav_label.strip() or f"{src_stop} → {dst_stop}"
-                    add_favourite(CUR_USER_ID, label, src_stop, dst_stop)
-                    st.success("Route saved to favourites!")
+                if st.button("⭐ Save Favourite"):
+                    ok = add_favourite(CUR_USER_ID, label, from_stop, to_stop)
+
+                    if ok:
+                      st.success("Saved to favourites!")
+                      st.rerun()
 
             # ── Leaflet Map ────────────────────────────────────────────────────
             st.markdown("#### 🗺️ Route Map")
