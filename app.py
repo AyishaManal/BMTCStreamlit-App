@@ -112,14 +112,17 @@ def login_user(email: str, password: str):
 
 def add_favourite(user_id, label, from_stop, to_stop):
     try:
-        db.collection("favorites").add({
+        doc_ref = db.collection("favorites").add({
             "user_id": user_id,
             "label": label,
             "from_stop": from_stop,
             "to_stop": to_stop,
             "added": firestore.SERVER_TIMESTAMP
         })
+
+        print("Saved doc:", doc_ref)  # server log
         return True
+
     except Exception as e:
         st.error(f"Error saving favourite: {e}")
         return False
@@ -877,11 +880,10 @@ with tab1:
             with fav_col2:
                 st.markdown("<br>", unsafe_allow_html=True)
                 if st.button("⭐ Save Favourite"):
-                    ok = add_favourite(CUR_USER_ID, label, from_stop, to_stop)
+    st.write("Button clicked")  # DEBUG
 
-                    if ok:
-                      st.success("Saved to favourites!")
-                      st.rerun()
+    ok = add_favourite(CUR_USER_ID, label, from_stop, to_stop)
+    st.write("Result:", ok)
 
             # ── Leaflet Map ────────────────────────────────────────────────────
             st.markdown("#### 🗺️ Route Map")
