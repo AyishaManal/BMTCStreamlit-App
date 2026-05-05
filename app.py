@@ -666,7 +666,7 @@ with tab1:
                     "From Delay": f"{h['src_delay']} min" if h["src_delay"] else "—",
                     "To Delay"  : f"{h['dst_delay']} min" if h["dst_delay"] else "—",
                     "Rain"      : "🌧️" if h["is_rain"] else "☀️",
-                    "Searched"  : h["searched"][:16],
+                    "Searched": h["searched"].strftime("%Y-%m-%d %H:%M") if h.get("searched") else "—",
                 })
             st.dataframe(pd.DataFrame(hist_data), use_container_width=True, height=240)
         else:
