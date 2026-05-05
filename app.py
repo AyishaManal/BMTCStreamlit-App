@@ -111,13 +111,18 @@ def login_user(email: str, password: str):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def add_favourite(user_id, label, from_stop, to_stop):
-    db.collection("favorites").add({
-        "user_id": user_id,
-        "label": label,
-        "from_stop": from_stop,
-        "to_stop": to_stop,
-        "added": firestore.SERVER_TIMESTAMP
-    })
+    try:
+        db.collection("favorites").add({
+            "user_id": user_id,
+            "label": label,
+            "from_stop": from_stop,
+            "to_stop": to_stop,
+            "added": firestore.SERVER_TIMESTAMP
+        })
+        return True
+    except Exception as e:
+        st.error(f"Error saving favourite: {e}")
+        return False
 
 
 def get_favourites(user_id):
