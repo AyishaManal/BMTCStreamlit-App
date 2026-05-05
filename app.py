@@ -149,15 +149,16 @@ def save_history(user_id, from_stop, to_stop, travel_date, travel_time,
 
 
 def get_history(user_id, limit=30):
-    docs = (
-        db.collection("travel_history")
-        .where("user_id", "==", user_id)
-        .order_by("searched", direction=firestore.Query.DESCENDING)
-        .limit(limit)
+    docs = db.collection("travel_history") \
+        .where("user_id", "==", user_id) \
         .stream()
-    )
 
-    return [doc.to_dict() for doc in docs]
+    data = [doc.to_dict() for doc in docs]
+
+    # Sort manually
+    data = sorted(data, key=lambda x: x.get("searched", ""), reverse=True)
+
+    return data[:limit]
 
 # ══════════════════════════════════════════════════════════════════════════════
 # AUTH UI
