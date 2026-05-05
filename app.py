@@ -1,6 +1,7 @@
-# BMTC Bus Delay Predictor — Bengaluru
-# Option C: XGBoost (all stops) + Prophet (top 30 high-delay stops)
-# NEW: Live OpenWeatherMap rain detection + current IST time as default
+# ============================================================
+# BMTC Bus Delay Predictor — Bengaluru  (Enhanced v3)
+# Features: Login · Favourites · Travel History · ETA · Leaflet Map
+# ============================================================
 
 import streamlit as st
 import pandas as pd
@@ -10,57 +11,246 @@ import joblib
 import json
 import os
 import re
+import sqlite3
+import hashlib
 import requests
+import streamlit.components.v1 as components
 from difflib import get_close_matches
 from datetime import date, datetime, timedelta
 import pytz
 import warnings
-warnings.filterwarnings('ignore')
+warnings.filterwarnings("ignore")
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="BMTC Delay Predictor",
     page_icon="🚌",
-    layout="centered"
+    layout="centered",
 )
 
-# ── File paths ────────────────────────────────────────────────────────────────
+# ── Paths ─────────────────────────────────────────────────────────────────────
 MODEL_DIR  = "models"
 OUTPUT_DIR = "outputs"
+DB_PATH    = "bmtc_users.db"   # SQLite file created automatically
 
 # ── OpenWeatherMap API key ────────────────────────────────────────────────────
-# Get a free key at https://openweathermap.org/api (Free tier: 60 calls/min)
-# Add it to Streamlit Cloud: Settings → Secrets → paste exactly as shown below:
+# ▶ HOW TO SET: Streamlit Cloud → App Settings → Secrets → paste:
 #
 #   [openweather]
-#   api_key = "your_actual_key_here"
+#   api_key = "YOUR_KEY_HERE"
 #
-# NOTE: st.secrets does NOT support chained .get() on nested keys.
-# Always use try/except for safe nested secret access.
+# Get a free key at https://openweathermap.org/api
 try:
     OWM_API_KEY = st.secrets["openweather"]["api_key"]
 except (KeyError, FileNotFoundError):
     OWM_API_KEY = ""
 
-# ── Live weather fetch ────────────────────────────────────────────────────────
-@st.cache_data(ttl=600)   # refresh every 10 minutes
+# ══════════════════════════════════════════════════════════════════════════════
+# DATABASE SETUP
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_db():
+    """Return a thread-local SQLite connection."""
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = get_db()
+    c = conn.cursor()
+
+    # Users table
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            email    TEXT    UNIQUE NOT NULL,
+            password TEXT    NOT NULL,
+            name     TEXT    NOT NULL,
+            created  TEXT    DEFAULT (datetime('now'))
+        )
+    """)
+
+    # Favourites table
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS favourites (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id   INTEGER NOT NULL,
+            label     TEXT    NOT NULL,
+            from_stop TEXT    NOT NULL,
+            to_stop   TEXT    NOT NULL,
+            added     TEXT    DEFAULT (datetime('now')),
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    """)
+
+    # Travel history table
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS travel_history (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id    INTEGER NOT NULL,
+            from_stop  TEXT    NOT NULL,
+            to_stop    TEXT    NOT NULL,
+            travel_date TEXT   NOT NULL,
+            travel_time TEXT   NOT NULL,
+            src_delay  REAL,
+            dst_delay  REAL,
+            is_rain    INTEGER,
+            searched   TEXT    DEFAULT (datetime('now')),
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# ── Auth helpers ──────────────────────────────────────────────────────────────
+def hash_password(pw: str) -> str:
+    return hashlib.sha256(pw.encode()).hexdigest()
+
+def register_user(email: str, password: str, name: str) -> tuple[bool, str]:
+    try:
+        conn = get_db()
+        conn.execute(
+            "INSERT INTO users (email, password, name) VALUES (?, ?, ?)",
+            (email.lower().strip(), hash_password(password), name.strip())
+        )
+        conn.commit()
+        conn.close()
+        return True, "Account created successfully!"
+    except sqlite3.IntegrityError:
+        return False, "An account with this email already exists."
+
+def login_user(email: str, password: str):
+    """Returns user Row or None."""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT * FROM users WHERE email=? AND password=?",
+        (email.lower().strip(), hash_password(password))
+    ).fetchone()
+    conn.close()
+    return row
+
+# ── Favourites helpers ────────────────────────────────────────────────────────
+def add_favourite(user_id, label, from_stop, to_stop):
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO favourites (user_id, label, from_stop, to_stop) VALUES (?,?,?,?)",
+        (user_id, label, from_stop, to_stop)
+    )
+    conn.commit(); conn.close()
+
+def get_favourites(user_id):
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM favourites WHERE user_id=? ORDER BY added DESC",
+        (user_id,)
+    ).fetchall()
+    conn.close()
+    return rows
+
+def delete_favourite(fav_id):
+    conn = get_db()
+    conn.execute("DELETE FROM favourites WHERE id=?", (fav_id,))
+    conn.commit(); conn.close()
+
+# ── History helpers ───────────────────────────────────────────────────────────
+def save_history(user_id, from_stop, to_stop, travel_date, travel_time,
+                 src_delay, dst_delay, is_rain):
+    conn = get_db()
+    conn.execute("""
+        INSERT INTO travel_history
+          (user_id, from_stop, to_stop, travel_date, travel_time,
+           src_delay, dst_delay, is_rain)
+        VALUES (?,?,?,?,?,?,?,?)
+    """, (user_id, from_stop, to_stop, str(travel_date), travel_time,
+          src_delay, dst_delay, is_rain))
+    conn.commit(); conn.close()
+
+def get_history(user_id, limit=30):
+    conn = get_db()
+    rows = conn.execute("""
+        SELECT * FROM travel_history
+        WHERE user_id=?
+        ORDER BY searched DESC LIMIT ?
+    """, (user_id, limit)).fetchall()
+    conn.close()
+    return rows
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AUTH UI  (shown when not logged in)
+# ══════════════════════════════════════════════════════════════════════════════
+if "user" not in st.session_state:
+    st.session_state["user"] = None
+
+def show_auth():
+    st.markdown("""
+        <h1 style='color:#1A3A5C;margin-bottom:0'>🚌 BMTC Delay Predictor</h1>
+        <p style='color:gray;margin-top:4px'>Bengaluru · ML-Powered Bus Delay Forecasting</p>
+        <hr>
+    """, unsafe_allow_html=True)
+
+    tab_login, tab_reg = st.tabs(["🔑 Login", "📝 Register"])
+
+    with tab_login:
+        st.subheader("Welcome back")
+        email = st.text_input("Email", key="li_email")
+        pw    = st.text_input("Password", type="password", key="li_pw")
+        if st.button("Login", type="primary", use_container_width=True, key="li_btn"):
+            if not email or not pw:
+                st.error("Please fill in both fields.")
+            else:
+                user = login_user(email, pw)
+                if user:
+                    st.session_state["user"] = dict(user)
+                    st.success(f"Welcome back, {user['name']}! 👋")
+                    st.rerun()
+                else:
+                    st.error("Invalid email or password.")
+
+    with tab_reg:
+        st.subheader("Create an account")
+        r_name  = st.text_input("Full Name", key="reg_name")
+        r_email = st.text_input("Email", key="reg_email")
+        r_pw    = st.text_input("Password (min 6 chars)", type="password", key="reg_pw")
+        r_pw2   = st.text_input("Confirm Password", type="password", key="reg_pw2")
+        if st.button("Create Account", type="primary", use_container_width=True, key="reg_btn"):
+            if not all([r_name, r_email, r_pw, r_pw2]):
+                st.error("Please fill in all fields.")
+            elif len(r_pw) < 6:
+                st.error("Password must be at least 6 characters.")
+            elif r_pw != r_pw2:
+                st.error("Passwords do not match.")
+            else:
+                ok, msg = register_user(r_email, r_pw, r_name)
+                if ok:
+                    st.success(msg + " Please log in.")
+                else:
+                    st.error(msg)
+
+if not st.session_state["user"]:
+    show_auth()
+    st.stop()
+
+# ── Shortcut for current user ─────────────────────────────────────────────────
+CUR_USER    = st.session_state["user"]
+CUR_USER_ID = CUR_USER["id"]
+
+# ══════════════════════════════════════════════════════════════════════════════
+# WEATHER
+# ══════════════════════════════════════════════════════════════════════════════
+@st.cache_data(ttl=600)
 def fetch_bengaluru_weather():
-    """
-    Returns (is_rain, description, temp_c, icon_url).
-    Falls back to (None, error_msg, None, None) if API key missing or call fails.
-    OWM weather IDs: < 700 = rain/drizzle/thunderstorm/snow
-    """
     if not OWM_API_KEY:
         return None, "no_key", None, None
     try:
-        url    = "https://api.openweathermap.org/data/2.5/weather"
-        params = {
-            "lat"   : 12.9716,    # Bengaluru city centre
-            "lon"   : 77.5946,
-            "appid" : OWM_API_KEY,
-            "units" : "metric",
-        }
-        r    = requests.get(url, params=params, timeout=5)
+        r = requests.get(
+            "https://api.openweathermap.org/data/2.5/weather",
+            params={"lat": 12.9716, "lon": 77.5946,
+                    "appid": OWM_API_KEY, "units": "metric"},
+            timeout=5,
+        )
         data = r.json()
         wid  = data["weather"][0]["id"]
         desc = data["weather"][0]["description"].capitalize()
@@ -70,40 +260,33 @@ def fetch_bengaluru_weather():
     except Exception as e:
         return None, str(e), None, None
 
-# ── Current IST time helper ───────────────────────────────────────────────────
+# ── IST time helpers ──────────────────────────────────────────────────────────
 def get_ist_now():
-    """Returns current datetime in Asia/Kolkata timezone."""
     return datetime.now(pytz.timezone("Asia/Kolkata"))
 
-# ── Build list of 30-min time slots ──────────────────────────────────────────
 def build_time_slots():
-    """
-    Returns list of labels like ['00:00','00:30','01:00', ... '23:30']
-    and a matching list of (hour, minute) tuples.
-    """
-    labels = []
-    values = []
+    labels, values = [], []
     for h in range(24):
         for m in (0, 30):
             labels.append(f"{h:02d}:{m:02d}")
             values.append((h, m))
     return labels, values
 
-TIME_LABELS, TIME_VALUES = build_time_slots()   # 48 slots
+TIME_LABELS, TIME_VALUES = build_time_slots()
 
 def slot_index_for(hour, minute):
-    """Find the nearest 30-min slot index for a given hour:minute."""
-    target = hour * 60 + minute
-    # round to nearest 30
+    target  = hour * 60 + minute
     rounded = round(target / 30) * 30
-    rounded = min(rounded, 23 * 60 + 30)   # cap at 23:30
-    h, m = divmod(rounded, 60)
+    rounded = min(rounded, 23 * 60 + 30)
+    h, m    = divmod(rounded, 60)
     try:
         return TIME_VALUES.index((h, m))
     except ValueError:
         return 0
 
-# ── Loaders ───────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# MODEL LOADERS
+# ══════════════════════════════════════════════════════════════════════════════
 @st.cache_resource
 def load_assets():
     xgb_model    = joblib.load(os.path.join(MODEL_DIR, "xgb_model.pkl"))
@@ -127,16 +310,13 @@ def load_prophet_stops():
 @st.cache_resource
 def load_prophet_model(stop_name):
     from prophet.serialize import model_from_json
-    safe = stop_name.replace(' ','_').replace('/','_').replace('(','').replace(')','')
+    safe = stop_name.replace(" ", "_").replace("/", "_").replace("(", "").replace(")", "")
     path = os.path.join(MODEL_DIR, "prophet", f"{safe}.json")
     if not os.path.exists(path):
         return None
     with open(path) as f:
         return model_from_json(f.read())
 
-# routes.csv / load_routes() removed — bus lookup now uses GTFS join (models/gtfs/)
-
-# ── Load everything at startup ────────────────────────────────────────────────
 try:
     xgb_model, stop_summary, metadata = load_assets()
     final_results = load_results()
@@ -145,226 +325,108 @@ try:
     all_stops     = sorted(stop_summary["stop_name"].tolist())
 except Exception as e:
     st.error(f"Failed to load model files: {e}")
-    st.info(
-        "Make sure you have run all three notebooks and copied the "
-        "`models/` and `outputs/` folders into the root of your GitHub repo."
-    )
+    st.info("Make sure models/ and outputs/ folders are present in your GitHub repo.")
     st.stop()
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def find_stop(query, n=6):
-    query = query.lower().strip()
-    exact = [s for s in all_stops if query in s.lower()]
-    if exact:
-        return exact[:n]
-    fuzzy = get_close_matches(query, [s.lower() for s in all_stops],
-                              n=n, cutoff=0.4)
-    return [s for s in all_stops if s.lower() in fuzzy]
-
 # ══════════════════════════════════════════════════════════════════════════════
-# BUS NUMBER LOOKUP  —  GTFS proper join pipeline
+# GTFS BUS LOOKUP
 # ══════════════════════════════════════════════════════════════════════════════
-#
-#  HOW IT WORKS (stop_name → bus numbers):
-#
-#   stops.txt       stop_name  ──►  stop_id
-#       ↓
-#   stop_times.txt  stop_id    ──►  trip_id  (all trips that call at this stop)
-#       ↓
-#   trips.txt       trip_id    ──►  route_id
-#       ↓
-#   routes.txt      route_id   ──►  route_short_name  (the bus number e.g. "335E")
-#
-#  For a FROM→TO pair we do this for both stops, then intersect the two sets
-#  of route_short_names → those are the buses that directly serve both stops.
-#
-#  FILES REQUIRED (place in models/gtfs/):
-#    stops.txt, stop_times.txt, trips.txt, routes.txt
-#
-#  If the gtfs/ folder is absent the app falls back gracefully with a message.
-# ──────────────────────────────────────────────────────────────────────────────
-
 GTFS_DIR = os.path.join(MODEL_DIR, "gtfs")
 
 @st.cache_resource(show_spinner=False)
 def load_gtfs_tables():
-    """
-    Load the four GTFS text files and build a dict:
-      stop_name_lower  →  set of route_short_name strings
-
-    Returns (lookup_dict, True) on success, ({}, False) if files are missing.
-    The heavy join is done once at startup and cached for the whole session.
-    """
     required = ["stops.txt", "stop_times.txt", "trips.txt", "routes.txt"]
     paths    = {f: os.path.join(GTFS_DIR, f) for f in required}
-
     if not all(os.path.exists(p) for p in paths.values()):
         return {}, False
 
-    # ── 1. stops: stop_id → stop_name ────────────────────────────────────────
-    stops = pd.read_csv(
-        paths["stops.txt"],
-        usecols=["stop_id", "stop_name"],
-        dtype=str,
-    ).dropna()
+    stops = pd.read_csv(paths["stops.txt"], usecols=["stop_id", "stop_name"], dtype=str).dropna()
     stops["stop_name_lower"] = stops["stop_name"].str.lower().str.strip()
-    stop_id_to_name = stops.set_index("stop_id")["stop_name"].to_dict()
 
-    # ── 2. routes: route_id → route_short_name ───────────────────────────────
-    routes = pd.read_csv(
-        paths["routes.txt"],
-        usecols=["route_id", "route_short_name"],
-        dtype=str,
-    ).dropna()
+    routes = pd.read_csv(paths["routes.txt"], usecols=["route_id", "route_short_name"], dtype=str).dropna()
     route_id_to_short = routes.set_index("route_id")["route_short_name"].to_dict()
 
-    # ── 3. trips: trip_id → route_id ─────────────────────────────────────────
-    trips = pd.read_csv(
-        paths["trips.txt"],
-        usecols=["trip_id", "route_id"],
-        dtype=str,
-    ).dropna()
+    trips = pd.read_csv(paths["trips.txt"], usecols=["trip_id", "route_id"], dtype=str).dropna()
     trip_id_to_route = trips.set_index("trip_id")["route_id"].to_dict()
 
-    # ── 4. stop_times: stop_id → set of trip_ids ─────────────────────────────
-    # stop_times.txt is the largest file — read only the two columns we need
-    stop_times = pd.read_csv(
-        paths["stop_times.txt"],
-        usecols=["trip_id", "stop_id"],
-        dtype=str,
-    ).dropna()
-
-    # ── 5. Build final lookup: stop_name_lower → set[route_short_name] ───────
-    # Merge stop_times → trips → routes in one vectorised pass
-    stop_times["route_id"] = stop_times["trip_id"].map(trip_id_to_route)
+    stop_times = pd.read_csv(paths["stop_times.txt"], usecols=["trip_id", "stop_id"], dtype=str).dropna()
+    stop_times["route_id"]         = stop_times["trip_id"].map(trip_id_to_route)
     stop_times["route_short_name"] = stop_times["route_id"].map(route_id_to_short)
-    stop_times["stop_name_lower"] = stop_times["stop_id"].map(
+    stop_times["stop_name_lower"]  = stop_times["stop_id"].map(
         stops.set_index("stop_id")["stop_name_lower"]
     )
-    stop_times = stop_times.dropna(
-        subset=["stop_name_lower", "route_short_name"]
-    )
+    stop_times = stop_times.dropna(subset=["stop_name_lower", "route_short_name"])
 
-    lookup: dict[str, set] = {}
+    lookup: dict = {}
     for row in stop_times[["stop_name_lower", "route_short_name"]].itertuples(index=False):
         lookup.setdefault(row.stop_name_lower, set()).add(row.route_short_name)
-
     return lookup, True
 
+@st.cache_resource(show_spinner=False)
+def load_gtfs_coords():
+    """Returns dict: stop_name_lower → (lat, lon)"""
+    path = os.path.join(GTFS_DIR, "stops.txt")
+    if not os.path.exists(path):
+        return {}
+    stops = pd.read_csv(path, usecols=["stop_name", "stop_lat", "stop_lon"], dtype=str).dropna()
+    coords = {}
+    for _, row in stops.iterrows():
+        try:
+            coords[row["stop_name"].lower().strip()] = (
+                float(row["stop_lat"]), float(row["stop_lon"])
+            )
+        except Exception:
+            pass
+    return coords
 
-def _best_gtfs_match(query: str, lookup: dict) -> str | None:
-    """
-    Find the best matching stop_name_lower key in the GTFS lookup dict.
-    Tries exact substring first, then difflib fuzzy match.
-    Returns the matched key or None.
-    """
+def _best_gtfs_match(query, lookup):
     q = query.lower().strip()
-    # Exact match
-    if q in lookup:
-        return q
-    # Substring match (query is contained in a gtfs stop name)
+    if q in lookup: return q
     substr = [k for k in lookup if q in k]
-    if substr:
-        # prefer the shortest match (most specific)
-        return min(substr, key=len)
-    # Reverse substring (gtfs stop name is contained in query)
+    if substr: return min(substr, key=len)
     substr2 = [k for k in lookup if k in q]
-    if substr2:
-        return max(substr2, key=len)
-    # Fuzzy fallback
+    if substr2: return max(substr2, key=len)
     matches = get_close_matches(q, list(lookup.keys()), n=1, cutoff=0.6)
     return matches[0] if matches else None
 
-
-def find_buses(src: str, dst: str) -> dict:
-    """
-    Look up bus numbers that serve both src and dst stops using GTFS data.
-
-    Returns:
-      {
-        "buses"  : list[str],   # route_short_names serving both stops
-        "source" : "gtfs" | "none",
-        "note"   : str,
-        "hops"   : int,         # 1 = direct routes found
-      }
-    """
+def find_buses(src, dst):
     lookup, gtfs_ok = load_gtfs_tables()
-
     if not gtfs_ok:
-        # GTFS files not present — inform the user clearly
-        return {
-            "buses" : [],
-            "source": "none",
-            "note"  : (
-                "GTFS files not found in models/gtfs/. "
-                "Add stops.txt, stop_times.txt, trips.txt, routes.txt "
-                "to enable bus number lookup."
-            ),
-            "hops"  : 0,
-        }
-
+        return {"buses": [], "source": "none",
+                "note": "GTFS files not found in models/gtfs/.", "hops": 0}
     src_key = _best_gtfs_match(src, lookup)
     dst_key = _best_gtfs_match(dst, lookup)
-
     if not src_key:
-        return {
-            "buses" : [],
-            "source": "none",
-            "note"  : f"Stop not found in GTFS: '{src}'. Try a nearby landmark name.",
-            "hops"  : 0,
-        }
+        return {"buses": [], "source": "none",
+                "note": f"Stop not found in GTFS: '{src}'.", "hops": 0}
     if not dst_key:
-        return {
-            "buses" : [],
-            "source": "none",
-            "note"  : f"Stop not found in GTFS: '{dst}'. Try a nearby landmark name.",
-            "hops"  : 0,
-        }
-
-    src_routes = lookup[src_key]   # all routes serving FROM stop
-    dst_routes = lookup[dst_key]   # all routes serving TO stop
-
-    # Direct buses = routes that call at BOTH stops
-    direct = sorted(src_routes & dst_routes)
-
+        return {"buses": [], "source": "none",
+                "note": f"Stop not found in GTFS: '{dst}'.", "hops": 0}
+    direct = sorted(lookup[src_key] & lookup[dst_key])
     if direct:
-        return {
-            "buses" : direct[:10],   # cap at 10 to keep UI clean
-            "source": "gtfs",
-            "note"  : (
-                f"BMTC GTFS data · matched '{src_key}' → '{dst_key}' · "
-                f"{len(direct)} direct route(s) found"
-            ),
-            "hops"  : 1,
-        }
+        return {"buses": direct[:10], "source": "gtfs",
+                "note": f"BMTC GTFS · {len(direct)} direct route(s)", "hops": 1}
+    src_list = sorted(lookup[src_key])[:5]
+    dst_list = sorted(lookup[dst_key])[:5]
+    return {"buses": [], "source": "none",
+            "note": (f"No direct bus. At {src}: {', '.join(src_list) or 'none'}. "
+                     f"At {dst}: {', '.join(dst_list) or 'none'}."), "hops": 2}
 
-    # No direct buses — show routes serving each stop separately as a hint
-    src_list = sorted(src_routes)[:5]
-    dst_list = sorted(dst_routes)[:5]
-    return {
-        "buses" : [],
-        "source": "none",
-        "note"  : (
-            f"No direct bus found. "
-            f"Buses at {src}: {', '.join(src_list) or 'none'}. "
-            f"Buses at {dst}: {', '.join(dst_list) or 'none'}. "
-            "You may need to transfer."
-        ),
-        "hops"  : 2,
-    }
+# ══════════════════════════════════════════════════════════════════════════════
+# PREDICTION HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+def find_stop(query, n=6):
+    query = query.lower().strip()
+    exact = [s for s in all_stops if query in s.lower()]
+    if exact: return exact[:n]
+    fuzzy = get_close_matches(query, [s.lower() for s in all_stops], n=n, cutoff=0.4)
+    return [s for s in all_stops if s.lower() in fuzzy]
 
 def build_features(stop_name, hour, dow, month, is_rain):
     row = stop_summary[stop_summary["stop_name"] == stop_name]
-    if row.empty:
-        return None, None
+    if row.empty: return None, None
     s     = row.iloc[0]
     avg_d = float(s["avg_delay"])
-    is_weekend = int(dow >= 5)
-    is_rush    = int(hour in [7, 8, 9, 17, 18, 19])
-    hour_sin   = np.sin(2 * np.pi * hour / 24)
-    hour_cos   = np.cos(2 * np.pi * hour / 24)
-    dow_sin    = np.sin(2 * np.pi * dow  / 7)
-    dow_cos    = np.cos(2 * np.pi * dow  / 7)
     input_dict = {
         "factor"      : float(s["factor"]),
         "trip_count"  : float(s["trip_count"]),
@@ -372,13 +434,13 @@ def build_features(stop_name, hour, dow, month, is_rain):
         "hour"        : hour,
         "day_of_week" : dow,
         "month"       : month,
-        "is_weekend"  : is_weekend,
-        "is_rush"     : is_rush,
+        "is_weekend"  : int(dow >= 5),
+        "is_rush"     : int(hour in [7, 8, 9, 17, 18, 19]),
         "is_rain"     : is_rain,
-        "hour_sin"    : hour_sin,
-        "hour_cos"    : hour_cos,
-        "dow_sin"     : dow_sin,
-        "dow_cos"     : dow_cos,
+        "hour_sin"    : np.sin(2 * np.pi * hour / 24),
+        "hour_cos"    : np.cos(2 * np.pi * hour / 24),
+        "dow_sin"     : np.sin(2 * np.pi * dow  / 7),
+        "dow_cos"     : np.cos(2 * np.pi * dow  / 7),
         "lag_1h"      : avg_d,
         "lag_24h"     : avg_d,
         "roll_3h"     : avg_d,
@@ -390,8 +452,7 @@ def build_features(stop_name, hour, dow, month, is_rain):
 
 def predict_delay(stop_name, hour, dow, month, is_rain):
     X, _ = build_features(stop_name, hour, dow, month, is_rain)
-    if X is None:
-        return 0.0
+    if X is None: return 0.0
     return round(float(np.clip(xgb_model.predict(X)[0], 0, None)), 1)
 
 def get_status(delay):
@@ -399,159 +460,303 @@ def get_status(delay):
     if delay < 8:  return "⚠️ Minor Delay",  "#92400E", "#FEF3C7"
     return               "🔴 Major Delay",   "#991B1B", "#FEE2E2"
 
-# ── Header ────────────────────────────────────────────────────────────────────
-st.markdown("""
-    <h1 style='color:#1A3A5C; margin-bottom:0'>🚌 BMTC Delay Predictor</h1>
-    <p style='color:gray; margin-top:4px'>
-        Bengaluru · ML-Powered Bus Delay Forecasting ·
-    </p>
-    <hr>
-""", unsafe_allow_html=True)
+def compute_eta(hour, minute, delay_min):
+    """Add predicted delay to departure time → ETA string."""
+    base = datetime(2000, 1, 1, hour, minute)
+    eta  = base + timedelta(minutes=delay_min)
+    diff = int(delay_min)
+    return eta.strftime("%H:%M"), diff
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+# ══════════════════════════════════════════════════════════════════════════════
+# LEAFLET MAP COMPONENT
+# ══════════════════════════════════════════════════════════════════════════════
+def render_leaflet_map(src_stop: str, dst_stop: str,
+                       src_delay: float, dst_delay: float) -> None:
+    """
+    Renders an interactive Leaflet map with:
+    - Colour-coded markers for FROM / TO stops
+    - A polyline connecting them (if coords available)
+    - Delay info in popups
+
+    ▶ REQUIRES: stops.txt in models/gtfs/ with stop_lat & stop_lon columns.
+    ▶ Uses OpenStreetMap tiles — no API key needed.
+    ▶ If you want Mapbox tiles instead, add your token below and swap the
+      tileLayer URL to:
+        https://api.mapbox.com/styles/v1/mapbox/streets-v11/tiles/{z}/{x}/{y}?access_token=YOUR_TOKEN
+    """
+    coords = load_gtfs_coords()
+
+    def get_coord(stop_name):
+        key = _best_gtfs_match(stop_name.lower(), coords) if coords else None
+        if key and key in coords:
+            return coords[key]
+        # Fallback: Bengaluru city centre
+        return (12.9716, 77.5946)
+
+    src_lat, src_lon = get_coord(src_stop)
+    dst_lat, dst_lon = get_coord(dst_stop)
+
+    def delay_color(d):
+        if d < 3:  return "#22c55e"   # green
+        if d < 8:  return "#f59e0b"   # amber
+        return            "#ef4444"   # red
+
+    src_col = delay_color(src_delay)
+    dst_col = delay_color(dst_delay)
+
+    src_status = get_status(src_delay)[0]
+    dst_status = get_status(dst_delay)[0]
+
+    center_lat = (src_lat + dst_lat) / 2
+    center_lon = (src_lon + dst_lon) / 2
+
+    html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <link rel="stylesheet"
+        href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <style>
+    body {{ margin:0; padding:0; }}
+    #map {{ width:100%; height:420px; border-radius:12px; }}
+    .legend {{
+      background:white; padding:10px 14px; border-radius:8px;
+      box-shadow:0 1px 6px rgba(0,0,0,0.2); font-size:12px; line-height:1.8;
+    }}
+  </style>
+</head>
+<body>
+<div id="map"></div>
+<script>
+  const map = L.map('map').setView([{center_lat}, {center_lon}], 13);
+
+  // ── Tile layer (OpenStreetMap — free, no key needed) ──────────────────────
+  // To use Mapbox: replace the URL with your Mapbox tile URL + access_token
+  L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+    attribution: '© <a href="https://openstreetmap.org">OpenStreetMap</a>',
+    maxZoom: 19
+  }}).addTo(map);
+
+  // ── Helper: coloured circle marker ───────────────────────────────────────
+  function circleMarker(lat, lon, color, title, delay, status) {{
+    const marker = L.circleMarker([lat, lon], {{
+      radius: 14,
+      fillColor: color,
+      color: '#fff',
+      weight: 3,
+      opacity: 1,
+      fillOpacity: 0.9
+    }}).addTo(map);
+    marker.bindPopup(`
+      <b>${{title}}</b><br>
+      🕐 Predicted delay: <b>${{delay}} min</b><br>
+      ${{status}}
+    `, {{ maxWidth: 180 }});
+    return marker;
+  }}
+
+  const srcMarker = circleMarker(
+    {src_lat}, {src_lon},
+    '{src_col}', '📍 FROM: {src_stop}',
+    {src_delay}, '{src_status}'
+  );
+
+  const dstMarker = circleMarker(
+    {dst_lat}, {dst_lon},
+    '{dst_col}', '🏁 TO: {dst_stop}',
+    {dst_delay}, '{dst_status}'
+  );
+
+  // ── Polyline connecting the two stops ─────────────────────────────────────
+  const routeLine = L.polyline(
+    [[{src_lat}, {src_lon}], [{dst_lat}, {dst_lon}]],
+    {{ color: '#1A3A5C', weight: 3, opacity: 0.7, dashArray: '8 6' }}
+  ).addTo(map);
+
+  // ── Open FROM popup by default ────────────────────────────────────────────
+  srcMarker.openPopup();
+
+  // ── Fit map to show both stops ────────────────────────────────────────────
+  const bounds = L.latLngBounds(
+    [{src_lat}, {src_lon}], [{dst_lat}, {dst_lon}]
+  );
+  map.fitBounds(bounds, {{ padding: [40, 40] }});
+
+  // ── Legend ────────────────────────────────────────────────────────────────
+  const legend = L.control({{ position: 'bottomright' }});
+  legend.onAdd = function () {{
+    const div = L.DomUtil.create('div', 'legend');
+    div.innerHTML = `
+      <b>Delay Severity</b><br>
+      <span style="color:#22c55e">●</span> On-Time (&lt;3 min)<br>
+      <span style="color:#f59e0b">●</span> Minor (3–8 min)<br>
+      <span style="color:#ef4444">●</span> Major (&gt;8 min)
+    `;
+    return div;
+  }};
+  legend.addTo(map);
+</script>
+</body>
+</html>
+"""
+    components.html(html, height=430, scrolling=False)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN APP HEADER + NAV
+# ══════════════════════════════════════════════════════════════════════════════
+col_h1, col_h2 = st.columns([4, 1])
+with col_h1:
+    st.markdown(f"""
+        <h1 style='color:#1A3A5C;margin-bottom:0'>🚌 BMTC Delay Predictor</h1>
+        <p style='color:gray;margin-top:4px'>
+            Bengaluru · ML-Powered · Welcome, <b>{CUR_USER['name']}</b> 👋
+        </p>
+    """, unsafe_allow_html=True)
+with col_h2:
+    if st.button("🚪 Logout", use_container_width=True):
+        st.session_state["user"] = None
+        st.rerun()
+
+st.markdown("<hr style='margin-top:0'>", unsafe_allow_html=True)
+
+tab1, tab2, tab3, tab4 = st.tabs([
     "🔍 Predict Journey",
     "📊 Model Results",
     "🧠 Delay Classifier",
-    "🛠️ Admin Dashboard",
     "ℹ️ About Project",
 ])
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 1 — JOURNEY PREDICTOR
+# TAB 1 — JOURNEY PREDICTOR  (with Favourites, History, ETA, Leaflet)
 # ══════════════════════════════════════════════════════════════════════════════
 with tab1:
+
+    # ── Sidebar-style Favourites panel ────────────────────────────────────────
+    with st.expander("⭐ My Favourites", expanded=False):
+        favs = get_favourites(CUR_USER_ID)
+        if favs:
+            for fav in favs:
+                fc1, fc2, fc3 = st.columns([3, 2, 1])
+                with fc1:
+                    st.markdown(f"**{fav['label']}**")
+                    st.caption(f"📍 {fav['from_stop']} → 🏁 {fav['to_stop']}")
+                with fc2:
+                    if st.button("Use this route", key=f"use_fav_{fav['id']}"):
+                        st.session_state["prefill_from"] = fav["from_stop"]
+                        st.session_state["prefill_to"]   = fav["to_stop"]
+                        st.rerun()
+                with fc3:
+                    if st.button("🗑️", key=f"del_fav_{fav['id']}"):
+                        delete_favourite(fav["id"])
+                        st.rerun()
+                st.markdown("---")
+        else:
+            st.info("No favourites yet. Search a route and save it!")
+
+    # ── Travel History panel ──────────────────────────────────────────────────
+    with st.expander("🕓 Travel History", expanded=False):
+        history = get_history(CUR_USER_ID)
+        if history:
+            hist_data = []
+            for h in history:
+                status_src = get_status(h["src_delay"])[0] if h["src_delay"] else "—"
+                hist_data.append({
+                    "Date"      : h["travel_date"],
+                    "Time"      : h["travel_time"],
+                    "From"      : h["from_stop"],
+                    "To"        : h["to_stop"],
+                    "From Delay": f"{h['src_delay']} min" if h["src_delay"] else "—",
+                    "To Delay"  : f"{h['dst_delay']} min" if h["dst_delay"] else "—",
+                    "Rain"      : "🌧️" if h["is_rain"] else "☀️",
+                    "Searched"  : h["searched"][:16],
+                })
+            st.dataframe(pd.DataFrame(hist_data), use_container_width=True, height=240)
+        else:
+            st.info("No history yet. Your searches will appear here.")
+
     st.subheader("Enter Your Journey Details")
 
-    # ── Stop inputs ───────────────────────────────────────────────────────────
+    # ── Pre-fill from favourites ───────────────────────────────────────────────
+    prefill_from = st.session_state.pop("prefill_from", "")
+    prefill_to   = st.session_state.pop("prefill_to", "")
+
     col1, col2 = st.columns(2)
     with col1:
         from_input = st.text_input("📍 FROM Stop",
+                                    value=prefill_from,
                                     placeholder="e.g. Halasuru, Hebbal")
     with col2:
         to_input   = st.text_input("🏁 TO Stop",
+                                    value=prefill_to,
                                     placeholder="e.g. Majestic, Silk Board")
 
-    # ── Calendar date picker ──────────────────────────────────────────────────
+    # ── Date picker ────────────────────────────────────────────────────────────
     st.markdown("📅 **Select Travel Date**")
     today       = date.today()
-    max_date    = today + timedelta(days=30)
-    travel_date = st.date_input(
-        " ",
-        value=today,
-        min_value=today,
-        max_value=max_date,
-        label_visibility="collapsed"
-    )
+    travel_date = st.date_input(" ", value=today,
+                                 min_value=today, max_value=today + timedelta(days=30),
+                                 label_visibility="collapsed")
     dow   = travel_date.weekday()
     month = travel_date.month
-    day   = ["Monday","Tuesday","Wednesday","Thursday",
-             "Friday","Saturday","Sunday"][dow]
-    st.caption(
-        f"📆 {travel_date.strftime('%d %B %Y')}  ({day})  "
-        f"— Month: {travel_date.strftime('%B')}"
-    )
+    day   = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"][dow]
+    st.caption(f"📆 {travel_date.strftime('%d %B %Y')}  ({day})")
 
-    # ── Time selector — 30-min slots, defaults to current IST time ───────────
+    # ── Time selector ─────────────────────────────────────────────────────────
     st.markdown("⏰ **Time of Travel**")
-
-    now_ist      = get_ist_now()
-    default_idx  = slot_index_for(now_ist.hour, now_ist.minute)
-
-    # Show current IST time as a hint above the selector
-    st.caption(
-        f"🕐 Current Bengaluru time: **{now_ist.strftime('%H:%M IST')}** "
-        f"— defaulting to nearest 30-min slot"
-    )
-
-    selected_label = st.selectbox(
-        " ",
-        options=TIME_LABELS,
-        index=default_idx,
-        label_visibility="collapsed",
-        help="Select your departure time. Defaults to current Bengaluru time."
-    )
-
-    # Parse the selected slot back to hour + minute
+    now_ist     = get_ist_now()
+    default_idx = slot_index_for(now_ist.hour, now_ist.minute)
+    st.caption(f"🕐 Current Bengaluru time: **{now_ist.strftime('%H:%M IST')}**")
+    selected_label = st.selectbox(" ", options=TIME_LABELS, index=default_idx,
+                                   label_visibility="collapsed")
     hour, minute = TIME_VALUES[TIME_LABELS.index(selected_label)]
 
-    # Show rush-hour / time-period context label
-    if hour in [7, 8, 9]:
-        st.caption("🔴 AM Rush Hour — expect higher delays")
-    elif hour in [17, 18, 19]:
-        st.caption("🔴 PM Rush Hour — expect higher delays")
-    elif 0 <= hour <= 5:
-        st.caption("🌙 Late Night — minimal traffic expected")
-    else:
-        st.caption("🟡 Normal Hours")
+    if   hour in [7, 8, 9]:      st.caption("🔴 AM Rush Hour — expect higher delays")
+    elif hour in [17, 18, 19]:   st.caption("🔴 PM Rush Hour — expect higher delays")
+    elif 0 <= hour <= 5:         st.caption("🌙 Late Night — minimal traffic expected")
+    else:                        st.caption("🟡 Normal Hours")
 
-    # ── Live weather from OpenWeatherMap ──────────────────────────────────────
+    # ── Live weather ──────────────────────────────────────────────────────────
     st.markdown("🌦️ **Weather Conditions**")
-
     live_rain, live_desc, live_temp, live_icon = fetch_bengaluru_weather()
 
     if live_rain is not None:
-        # API call succeeded — show live weather and use it as default
-        wcol1, wcol2 = st.columns([1, 4])
-        with wcol1:
-            if live_icon:
-                st.image(live_icon, width=60)
-        with wcol2:
-            rain_emoji = "🌧️" if live_rain else "☀️"
-            st.markdown(
-                f"**Live Bengaluru weather:** {rain_emoji} {live_desc}  "
-                f"| 🌡️ {live_temp}°C"
-            )
+        wc1, wc2 = st.columns([1, 4])
+        with wc1:
+            if live_icon: st.image(live_icon, width=60)
+        with wc2:
+            st.markdown(f"**Live weather:** {'🌧️' if live_rain else '☀️'} {live_desc}  |  🌡️ {live_temp}°C")
             st.caption("Auto-detected via OpenWeatherMap · updates every 10 min")
-
-        # Toggle defaults to live rain state but user can still override
-        is_rain = int(st.toggle(
-            "🌧️ Raining? (auto-detected — override if needed)",
-            value=bool(live_rain)
-        ))
-
-    elif live_rain is None and live_desc == "no_key":
-        # No API key configured — fall back to manual toggle
-        st.info(
-            "💡 Add your free OpenWeatherMap API key to Streamlit secrets "
-            "for live rain detection. Using manual toggle for now.",
-            icon="ℹ️"
-        )
+        is_rain = int(st.toggle("🌧️ Raining? (override if needed)", value=bool(live_rain)))
+    elif live_desc == "no_key":
+        st.info("💡 Add your OpenWeatherMap API key in Streamlit secrets for live rain detection.")
         is_rain = int(st.toggle("🌧️ Raining?", value=False))
-
     else:
-        # API key present but call failed (network issue, bad key, etc.)
         st.warning(f"Weather fetch failed ({live_desc}). Using manual toggle.")
         is_rain = int(st.toggle("🌧️ Raining?", value=False))
 
     if month in [6, 7, 8, 9]:
         st.caption("☔ Monsoon season — rain likely to add 2–5 min extra delay")
 
-    # ── Stop search dropdowns ─────────────────────────────────────────────────
+    # ── Stop fuzzy search ──────────────────────────────────────────────────────
     src_stop, dst_stop = None, None
-
     if from_input:
-        from_matches = find_stop(from_input)
-        if from_matches:
-            src_stop = st.selectbox("Select FROM stop:", from_matches, key="src")
-        else:
-            st.warning("No FROM stop found. Try a different name.")
-
+        matches = find_stop(from_input)
+        if matches:   src_stop = st.selectbox("Select FROM stop:", matches, key="src")
+        else:          st.warning("No FROM stop found. Try a different name.")
     if to_input:
-        to_matches = find_stop(to_input)
-        if to_matches:
-            dst_stop = st.selectbox("Select TO stop:", to_matches, key="dst")
-        else:
-            st.warning("No TO stop found. Try a different name.")
+        matches = find_stop(to_input)
+        if matches:   dst_stop = st.selectbox("Select TO stop:", matches, key="dst")
+        else:          st.warning("No TO stop found. Try a different name.")
 
     # ── Predict button ────────────────────────────────────────────────────────
     if st.button("🔍 Predict Delay", type="primary", use_container_width=True):
-
         if not src_stop or not dst_stop:
             st.error("Please enter both FROM and TO stops.")
         elif src_stop == dst_stop:
             st.error("FROM and TO stops cannot be the same.")
         else:
-            # ── Run delay prediction + bus lookup in parallel ─────────────────
             src_delay = predict_delay(src_stop, hour, dow, month, is_rain)
             dst_delay = predict_delay(dst_stop, hour, dow, month, is_rain)
 
@@ -564,21 +769,16 @@ with tab1:
 
             buses  = bus_result["buses"]
             source = bus_result["source"]
-            note   = bus_result["note"]
+            note   = re.sub(r"\[([^\]]+)\]\((https?://[^\)]+)\)", r"\1 (\2)", bus_result["note"])
 
-            # ── Sanitise note: strip any markdown link syntax ─────────────────
-            note = re.sub(
-                r"\[([^\]]+)\]\((https?://[^\)]+)\)",
-                r"\1 (\2)",
-                note
-            )
+            # ── ETA ───────────────────────────────────────────────────────────
+            src_eta, src_extra = compute_eta(hour, minute, src_delay)
+            dst_eta, dst_extra = compute_eta(hour, minute, dst_delay)
 
-            # ── Weather & time meta ───────────────────────────────────────────
+            # ── Travel tip ────────────────────────────────────────────────────
             weather_icon = "🌧️ Rain" if is_rain else "☀️ Clear"
             rush_note    = " · 🔴 AM Rush" if hour in [7,8,9] else (
                            " · 🔴 PM Rush" if hour in [17,18,19] else "")
-
-            # ── Tip ──────────────────────────────────────────────────────────
             if worse >= 8:
                 tip_bg, tip_icon, tip_text = "#FEE2E2", "🔴", "Leave early — heavy delays expected!"
             elif worse >= 3:
@@ -586,263 +786,162 @@ with tab1:
             else:
                 tip_bg, tip_icon, tip_text = "#D1FAE5", "✅", "Good time to travel — minimal delays expected."
 
-            # ── Source badge ─────────────────────────────────────────────────
+            # ── Bus pills ─────────────────────────────────────────────────────
+            PILL = ("display:inline-block;background:#1E3A5F;color:#E0F2FE;"
+                    "border-radius:6px;padding:4px 10px;margin:3px 4px 3px 0;"
+                    "font-weight:700;font-size:0.9rem;letter-spacing:0.02em")
             dot_color, dot_label = {
-                "live"  : ("#22C55E", "🟢 Live data"),
                 "gtfs"  : ("#16A34A", "🟢 BMTC GTFS data"),
-                "static": ("#F97316", "🟠 Estimated"),
                 "none"  : ("#9CA3AF", "⚪ Not found"),
             }.get(source, ("#9CA3AF", ""))
 
-            # ── Bus pills HTML (no f-string quotes inside style) ─────────────
-            PILL = (
-                "display:inline-block;"
-                "background:#1E3A5F;"
-                "color:#E0F2FE;"
-                "border-radius:6px;"
-                "padding:4px 10px;"
-                "margin:3px 4px 3px 0;"
-                "font-weight:700;"
-                "font-size:0.9rem;"
-                "letter-spacing:0.02em"
-            )
             if buses:
-                pills = "".join(f'<span style="{PILL}">{b}</span>' for b in buses)
+                pills    = "".join(f'<span style="{PILL}">{b}</span>' for b in buses)
                 bus_html = (
-                    '<div style="margin-top:14px;padding-top:14px;'
-                    'border-top:1px solid #E2E8F0">'
+                    '<div style="margin-top:14px;padding-top:14px;border-top:1px solid #E2E8F0">'
                     '<p style="margin:0 0 8px 0;font-weight:700;color:#1A3A5C;font-size:0.9rem">'
-                    "🚌 Buses on this corridor</p>"
-                    f'<div style="line-height:2">{pills}</div>'
+                    f'🚌 Buses on this corridor</p><div style="line-height:2">{pills}</div>'
                     f'<p style="margin:8px 0 0 0;font-size:0.75rem;color:{dot_color}">'
-                    f"{dot_label} · {note}</p>"
-                    "</div>"
+                    f'{dot_label} · {note}</p></div>'
                 )
             else:
                 bus_html = (
-                    '<div style="margin-top:14px;padding-top:14px;'
-                    'border-top:1px solid #E2E8F0">'
-                    '<p style="margin:0;font-size:0.85rem;color:#6B7280">'
-                    f"🚌 Bus numbers unavailable for this corridor.<br>"
-                    f'<span style="font-size:0.75rem">{note}</span></p>'
-                    "</div>"
+                    '<div style="margin-top:14px;padding-top:14px;border-top:1px solid #E2E8F0">'
+                    f'<p style="margin:0;font-size:0.85rem;color:#6B7280">'
+                    f'🚌 Bus numbers unavailable.<br>'
+                    f'<span style="font-size:0.75rem">{note}</span></p></div>'
                 )
 
-            # ══════════════════════════════════════════════════════════════════
-            # UNIFIED OUTPUT CARD — rendered via st.components.v1.html()
-            # so Streamlit's markdown parser never touches the HTML
-            # ══════════════════════════════════════════════════════════════════
-            import streamlit.components.v1 as components
-
+            # ── Result card ───────────────────────────────────────────────────
+            st.markdown("---")
             card_html = f"""
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
+<!DOCTYPE html><html><head><meta charset="utf-8">
 <style>
-  body {{ margin:0; padding:0; font-family: -apple-system, BlinkMacSystemFont,
-          'Segoe UI', Roboto, sans-serif; background:transparent; }}
-  .card {{
-    background:#FFFFFF;
-    border:1px solid #E2E8F0;
-    border-radius:14px;
-    padding:22px 24px 18px 24px;
-    box-shadow:0 2px 12px rgba(0,0,0,0.07);
-  }}
-  .meta {{ font-size:0.8rem; color:#64748B; margin:4px 0 16px 0; }}
-  .route-header {{ display:flex; align-items:center; gap:8px; margin-bottom:4px; }}
-  .route-header span {{ font-size:1.05rem; font-weight:700; color:#1A3A5C; }}
-  .route-header .arrow {{ color:#64748B; font-size:1.1rem; }}
-  .grid {{ display:grid; grid-template-columns:1fr 1fr; gap:12px; }}
-  .delay-card {{
-    border-radius:10px;
-    padding:16px 18px;
-  }}
-  .delay-card .role {{
-    margin:0 0 2px 0;
-    font-size:0.72rem;
-    font-weight:700;
-    text-transform:uppercase;
-    letter-spacing:0.07em;
-  }}
-  .delay-card .stop-name {{
-    margin:0 0 6px 0;
-    font-size:0.85rem;
-    font-weight:600;
-  }}
-  .delay-card .delay-val {{
-    margin:0;
-    font-size:2rem;
-    font-weight:800;
-    line-height:1;
-  }}
-  .delay-card .delay-val span {{ font-size:1rem; font-weight:500; }}
-  .delay-card .status {{
-    margin:4px 0 0 0;
-    font-size:0.85rem;
-  }}
-  .tip {{
-    margin-top:14px;
-    border-radius:8px;
-    padding:10px 14px;
-    font-size:0.88rem;
-    font-weight:600;
-    color:#1A3A5C;
-  }}
-</style>
-</head>
-<body>
+  body{{margin:0;padding:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:transparent}}
+  .card{{background:#fff;border:1px solid #E2E8F0;border-radius:14px;padding:22px 24px 18px;
+          box-shadow:0 2px 12px rgba(0,0,0,.07)}}
+  .meta{{font-size:.8rem;color:#64748B;margin:4px 0 16px}}
+  .rh{{display:flex;align-items:center;gap:8px;margin-bottom:4px}}
+  .rh span{{font-size:1.05rem;font-weight:700;color:#1A3A5C}}
+  .grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px}}
+  .dc{{border-radius:10px;padding:16px 18px}}
+  .dc .role{{margin:0 0 2px;font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em}}
+  .dc .sn{{margin:0 0 6px;font-size:.85rem;font-weight:600}}
+  .dc .dv{{margin:0;font-size:2rem;font-weight:800;line-height:1}}
+  .dc .dv span{{font-size:1rem;font-weight:500}}
+  .dc .st{{margin:2px 0 0;font-size:.85rem}}
+  .dc .eta{{margin:4px 0 0;font-size:.78rem;opacity:.8}}
+  .tip{{margin-top:14px;border-radius:8px;padding:10px 14px;font-size:.88rem;font-weight:600;color:#1A3A5C}}
+</style></head><body>
 <div class="card">
-
-  <div class="route-header">
+  <div class="rh">
     <span>📍 {src_stop}</span>
-    <span class="arrow">→</span>
+    <span style="color:#64748B;font-size:1.1rem">→</span>
     <span>🏁 {dst_stop}</span>
   </div>
-  <p class="meta">
-    📅 {travel_date.strftime('%d %b %Y')} ({day})
-    &nbsp;·&nbsp; ⏰ {selected_label}
-    &nbsp;·&nbsp; {weather_icon}{rush_note}
-  </p>
-
+  <p class="meta">📅 {travel_date.strftime('%d %b %Y')} ({day}) &nbsp;·&nbsp;
+     ⏰ {selected_label} &nbsp;·&nbsp; {weather_icon}{rush_note}</p>
   <div class="grid">
-    <div class="delay-card"
-         style="background:{src_bg};border-left:5px solid {src_color}">
-      <p class="role"    style="color:{src_color}">FROM</p>
-      <p class="stop-name" style="color:{src_color}">{src_stop}</p>
-      <p class="delay-val" style="color:{src_color}">{src_delay}
-         <span>min</span></p>
-      <p class="status"  style="color:{src_color}">{src_label}</p>
+    <div class="dc" style="background:{src_bg};border-left:5px solid {src_color}">
+      <p class="role" style="color:{src_color}">FROM</p>
+      <p class="sn"   style="color:{src_color}">{src_stop}</p>
+      <p class="dv"   style="color:{src_color}">{src_delay}<span> min</span></p>
+      <p class="st"   style="color:{src_color}">{src_label}</p>
+      <p class="eta"  style="color:{src_color}">🕐 ETA: {src_eta} (+{src_extra} min)</p>
     </div>
-    <div class="delay-card"
-         style="background:{dst_bg};border-left:5px solid {dst_color}">
-      <p class="role"    style="color:{dst_color}">TO</p>
-      <p class="stop-name" style="color:{dst_color}">{dst_stop}</p>
-      <p class="delay-val" style="color:{dst_color}">{dst_delay}
-         <span>min</span></p>
-      <p class="status"  style="color:{dst_color}">{dst_label}</p>
+    <div class="dc" style="background:{dst_bg};border-left:5px solid {dst_color}">
+      <p class="role" style="color:{dst_color}">TO</p>
+      <p class="sn"   style="color:{dst_color}">{dst_stop}</p>
+      <p class="dv"   style="color:{dst_color}">{dst_delay}<span> min</span></p>
+      <p class="st"   style="color:{dst_color}">{dst_label}</p>
+      <p class="eta"  style="color:{dst_color}">🕐 ETA: {dst_eta} (+{dst_extra} min)</p>
     </div>
   </div>
-
   {bus_html}
+  <div class="tip" style="background:{tip_bg}">{tip_icon} {tip_text}</div>
+</div></body></html>"""
+            components.html(card_html, height=450, scrolling=False)
 
-  <div class="tip" style="background:{tip_bg}">
-    {tip_icon} {tip_text}
-  </div>
+            # ── Save to history ────────────────────────────────────────────────
+            save_history(CUR_USER_ID, src_stop, dst_stop, travel_date,
+                         selected_label, src_delay, dst_delay, is_rain)
 
-</div>
-</body>
-</html>
-"""
-            st.markdown("---")
-            components.html(card_html, height=420, scrolling=False)
+            # ── Save to Favourites ─────────────────────────────────────────────
+            st.markdown("#### ⭐ Save This Route")
+            fav_col1, fav_col2 = st.columns([3, 1])
+            with fav_col1:
+                fav_label = st.text_input("Label for this route (optional)",
+                                          placeholder=f"{src_stop} → {dst_stop}",
+                                          key="fav_label_input")
+            with fav_col2:
+                st.markdown("<br>", unsafe_allow_html=True)
+                if st.button("⭐ Save Favourite", key="save_fav_btn"):
+                    label = fav_label.strip() or f"{src_stop} → {dst_stop}"
+                    add_favourite(CUR_USER_ID, label, src_stop, dst_stop)
+                    st.success("Route saved to favourites!")
 
-            # ── 24-hour forecast chart ────────────────────────────────────────
+            # ── Leaflet Map ────────────────────────────────────────────────────
+            st.markdown("#### 🗺️ Route Map")
+            st.caption("Colour-coded by predicted delay severity. Click markers for details.")
+            render_leaflet_map(src_stop, dst_stop, src_delay, dst_delay)
+
+            # ── 24-hr Forecast Chart ──────────────────────────────────────────
             st.markdown("#### 24-Hour Delay Forecast")
-
             src_has_prophet = src_stop in prophet_stops
             dst_has_prophet = dst_stop in prophet_stops
-            hours           = list(range(24))
+            hours = list(range(24))
 
-            if src_has_prophet or dst_has_prophet:
-                def get_24h(stop_name, has_prophet):
-                    if has_prophet:
-                        m = load_prophet_model(stop_name)
-                        if m:
-                            future = pd.DataFrame({
-                                "ds"     : pd.date_range("2024-07-01",
-                                                          periods=24, freq="h"),
-                                "is_rush": [1 if h in [7,8,9,17,18,19] else 0
-                                            for h in range(24)]
-                            })
-                            fc = m.predict(future)
-                            return (fc["yhat"].clip(lower=0).tolist(),
-                                    fc["yhat_lower"].clip(lower=0).tolist(),
-                                    fc["yhat_upper"].clip(lower=0).tolist())
-                    vals = [predict_delay(stop_name, h, dow, month, is_rain)
-                            for h in hours]
-                    return vals, None, None
+            def get_24h(stop_name, has_prophet):
+                if has_prophet:
+                    m = load_prophet_model(stop_name)
+                    if m:
+                        future = pd.DataFrame({
+                            "ds"     : pd.date_range("2024-07-01", periods=24, freq="h"),
+                            "is_rush": [1 if h in [7,8,9,17,18,19] else 0 for h in range(24)]
+                        })
+                        fc = m.predict(future)
+                        return (fc["yhat"].clip(lower=0).tolist(),
+                                fc["yhat_lower"].clip(lower=0).tolist(),
+                                fc["yhat_upper"].clip(lower=0).tolist())
+                vals = [predict_delay(stop_name, h, dow, month, is_rain) for h in hours]
+                return vals, None, None
 
-                src_24, src_lo, src_hi = get_24h(src_stop, src_has_prophet)
-                dst_24, dst_lo, dst_hi = get_24h(dst_stop, dst_has_prophet)
+            src_24, src_lo, src_hi = get_24h(src_stop, src_has_prophet)
+            dst_24, dst_lo, dst_hi = get_24h(dst_stop, dst_has_prophet)
 
-                fig, ax = plt.subplots(figsize=(10, 4))
-                ax.plot(hours, src_24,
-                        label=f"{src_stop[:22]} "
-                              f"{'(Prophet)' if src_has_prophet else '(XGBoost)'}",
-                        color='steelblue', lw=2, marker='o', markersize=3)
-                if src_lo:
-                    ax.fill_between(hours, src_lo, src_hi,
-                                    alpha=0.12, color='steelblue')
-                ax.plot(hours, dst_24,
-                        label=f"{dst_stop[:22]} "
-                              f"{'(Prophet)' if dst_has_prophet else '(XGBoost)'}",
-                        color='crimson', lw=2, marker='s', markersize=3)
-                if dst_lo:
-                    ax.fill_between(hours, dst_lo, dst_hi,
-                                    alpha=0.12, color='crimson')
-            else:
-                src_24 = [predict_delay(src_stop, h, dow, month, is_rain)
-                          for h in hours]
-                dst_24 = [predict_delay(dst_stop, h, dow, month, is_rain)
-                          for h in hours]
-                fig, ax = plt.subplots(figsize=(10, 4))
-                ax.plot(hours, src_24,
-                        label=f"{src_stop[:25]} (XGBoost)",
-                        color='steelblue', lw=2, marker='o', markersize=3)
-                ax.plot(hours, dst_24,
-                        label=f"{dst_stop[:25]} (XGBoost)",
-                        color='crimson', lw=2, marker='s', markersize=3)
+            fig, ax = plt.subplots(figsize=(10, 4))
+            lbl_s = f"{src_stop[:22]} ({'Prophet' if src_has_prophet else 'XGBoost'})"
+            lbl_d = f"{dst_stop[:22]} ({'Prophet' if dst_has_prophet else 'XGBoost'})"
+            ax.plot(hours, src_24, label=lbl_s, color="steelblue", lw=2, marker="o", markersize=3)
+            if src_lo: ax.fill_between(hours, src_lo, src_hi, alpha=0.12, color="steelblue")
+            ax.plot(hours, dst_24, label=lbl_d, color="crimson",  lw=2, marker="s", markersize=3)
+            if dst_lo: ax.fill_between(hours, dst_lo, dst_hi, alpha=0.12, color="crimson")
 
-            # Mark selected time on the chart
-            ax.axvline(hour + minute/60, color='gray', ls='--', lw=1.5,
-                       label=f'Your time ({selected_label})')
-            ax.axvspan(7,  9,  alpha=0.10, color='red',    label='AM Rush')
-            ax.axvspan(17, 19, alpha=0.10, color='orange', label='PM Rush')
-            ax.set_xlabel("Hour of Day")
-            ax.set_ylabel("Predicted Delay (min)")
-            ax.set_title(
-                f"{travel_date.strftime('%d %b %Y')} ({day})"
-                f"{'  🌧️ Rain' if is_rain else ''}"
-            )
-            ax.legend(fontsize=8)
-            ax.grid(alpha=0.3)
-            ax.set_xticks(range(0, 24, 2))
+            ax.axvline(hour + minute/60, color="gray", ls="--", lw=1.5,
+                       label=f"Your time ({selected_label})")
+            ax.axvspan(7,  9,  alpha=0.10, color="red",    label="AM Rush")
+            ax.axvspan(17, 19, alpha=0.10, color="orange", label="PM Rush")
+            ax.set_xlabel("Hour of Day"); ax.set_ylabel("Predicted Delay (min)")
+            ax.set_title(f"{travel_date.strftime('%d %b %Y')} ({day})"
+                         f"{'  🌧️ Rain' if is_rain else ''}")
+            ax.legend(fontsize=8); ax.grid(alpha=0.3); ax.set_xticks(range(0, 24, 2))
             plt.tight_layout()
-            st.pyplot(fig)
-            plt.close()
-
-            if src_has_prophet or dst_has_prophet:
-                st.caption(
-                    "Shaded band = 80% confidence interval (Prophet stops). "
-                    "Stops without a Prophet model use XGBoost point estimate."
-                )
+            st.pyplot(fig); plt.close()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 2 — MODEL RESULTS
 # ══════════════════════════════════════════════════════════════════════════════
 with tab2:
     st.subheader("Model Performance Comparison")
-
     n_stops = metadata.get("n_stops", "~1,955")
     st.markdown(
         f"Models trained on 180 days of hourly delay data across "
         f"**{n_stops:,} BMTC stops**. "
-        "Evaluated on a time-based held-out 20% test set "
-        "(future dates the model never saw)."
+        "Evaluated on a time-based held-out 20% test set."
     )
+    st.dataframe(final_results.set_index("Model"), use_container_width=True)
+    st.caption("RMSE and MAE in minutes — lower is better.")
 
-    st.dataframe(
-        final_results.set_index("Model"),
-        use_container_width=True
-    )
-    st.caption(
-        "RMSE and MAE in minutes — lower is better. "
-        "XGBoost (all stops) is the primary model used for live prediction. "
-        "ARIMA/SARIMA/LSTM metrics are from the busiest stop only."
-    )
-
-    st.markdown("#### RMSE & MAE — All Models")
     img = os.path.join(OUTPUT_DIR, "model_comparison.png")
     if os.path.exists(img):
         st.image(img, use_container_width=True)
@@ -856,14 +955,11 @@ with tab2:
         ax.bar(x + 0.2, plot_df["MAE"],  0.35, label="MAE",  color="darkorange")
         ax.set_xticks(x)
         ax.set_xticklabels(plot_df["Model"], rotation=12, ha="right", fontsize=8)
-        ax.set_ylabel("Error (minutes)")
-        ax.set_title("RMSE & MAE — All Models")
+        ax.set_ylabel("Error (minutes)"); ax.set_title("RMSE & MAE — All Models")
         ax.legend(); ax.grid(axis="y", alpha=0.3)
-        plt.tight_layout()
-        st.pyplot(fig)
-        plt.close()
+        plt.tight_layout(); st.pyplot(fig); plt.close()
 
-    image_sections = [
+    for title, fname in [
         ("XGBoost Feature Importance",           "feature_importance.png"),
         ("XGBoost Training Curve",               "xgb_training_curve.png"),
         ("XGBoost — Actual vs Predicted",        "xgb_predictions.png"),
@@ -873,16 +969,12 @@ with tab2:
         ("LSTM — Actual vs Predicted",           "lstm_predictions.png"),
         ("EDA — Delay Patterns",                 "eda.png"),
         ("Rain Effect on Delays",                "rain_effect.png"),
-    ]
-    for title, fname in image_sections:
+    ]:
         path = os.path.join(OUTPUT_DIR, fname)
         if os.path.exists(path):
             st.markdown(f"#### {title}")
             st.image(path, use_container_width=True)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 3 — ABOUT
-# ══════════════════════════════════════════════════════════════════════════════
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 3 — DELAY CLASSIFIER
 # ══════════════════════════════════════════════════════════════════════════════
@@ -890,30 +982,25 @@ with tab3:
     st.subheader("🧠 Delay Severity Classifier")
     st.markdown(
         "Classifies a stop's delay into **On-Time / Minor Delay / Major Delay** "
-        "using the XGBoost regression output + domain thresholds. "
-        "Shows predicted probability per class and the top feature drivers."
+        "using the XGBoost regression output + domain thresholds."
     )
     st.markdown("---")
 
-    # ── Inputs ────────────────────────────────────────────────────────────────
     c1, c2 = st.columns(2)
     with c1:
-        cls_stop_input = st.text_input("🔍 Stop Name", placeholder="e.g. Hebbal, Silk Board",
-                                       key="cls_stop")
+        cls_stop_input = st.text_input("🔍 Stop Name", placeholder="e.g. Hebbal, Silk Board", key="cls_stop")
     with c2:
-        cls_hour = st.slider("⏰ Hour of Day", 0, 23,
-                             value=get_ist_now().hour, key="cls_hour")
+        cls_hour = st.slider("⏰ Hour of Day", 0, 23, value=get_ist_now().hour, key="cls_hour")
 
     c3, c4, c5 = st.columns(3)
     with c3:
-        cls_dow = st.selectbox("📅 Day", ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"],
-                               key="cls_dow")
+        cls_dow = st.selectbox("📅 Day", ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"], key="cls_dow")
         dow_map = {"Mon":0,"Tue":1,"Wed":2,"Thu":3,"Fri":4,"Sat":5,"Sun":6}
         cls_dow_int = dow_map[cls_dow]
     with c4:
         cls_month = st.selectbox("📆 Month", list(range(1,13)),
-                                 format_func=lambda m: datetime(2024,m,1).strftime("%B"),
-                                 index=get_ist_now().month - 1, key="cls_month")
+                                  format_func=lambda m: datetime(2024,m,1).strftime("%B"),
+                                  index=get_ist_now().month - 1, key="cls_month")
     with c5:
         cls_rain = int(st.toggle("🌧️ Rain", key="cls_rain"))
 
@@ -934,34 +1021,24 @@ with tab3:
             else:
                 raw_delay = float(np.clip(xgb_model.predict(X_cls)[0], 0, None))
 
-                # ── Classify ──────────────────────────────────────────────────
-                # Thresholds: <3 min = On-Time, 3–8 = Minor, ≥8 = Major
                 if raw_delay < 3:
-                    cls_label = "✅ On-Time"
-                    cls_color = "#065F46"; cls_bg = "#D1FAE5"
-                    # Soft-probability: triangle distribution around 0
+                    cls_label = "✅ On-Time";    cls_color = "#065F46"; cls_bg = "#D1FAE5"
                     p_ontime = max(0.0, min(1.0, 1.0 - raw_delay / 3.0))
-                    p_minor  = 1.0 - p_ontime
-                    p_major  = 0.0
+                    p_minor  = 1.0 - p_ontime;  p_major  = 0.0
                 elif raw_delay < 8:
-                    cls_label = "⚠️ Minor Delay"
-                    cls_color = "#92400E"; cls_bg = "#FEF3C7"
-                    t = (raw_delay - 3) / 5.0          # 0→1 across [3,8]
+                    cls_label = "⚠️ Minor Delay"; cls_color = "#92400E"; cls_bg = "#FEF3C7"
+                    t = (raw_delay - 3) / 5.0
                     p_minor  = max(0.4, 1.0 - abs(t - 0.5))
                     p_ontime = max(0.0, 0.5 - t * 0.5)
                     p_major  = max(0.0, t * 0.5)
-                    total    = p_ontime + p_minor + p_major
+                    total = p_ontime + p_minor + p_major
                     p_ontime /= total; p_minor /= total; p_major /= total
                 else:
-                    cls_label = "🔴 Major Delay"
-                    cls_color = "#991B1B"; cls_bg = "#FEE2E2"
+                    cls_label = "🔴 Major Delay"; cls_color = "#991B1B"; cls_bg = "#FEE2E2"
                     p_major  = min(1.0, 0.5 + (raw_delay - 8) / 20.0)
-                    p_minor  = 1.0 - p_major
-                    p_ontime = 0.0
+                    p_minor  = 1.0 - p_major;    p_ontime = 0.0
 
-                # ── Feature importance / impact ────────────────────────────────
                 feat_vals = X_cls.iloc[0].to_dict()
-                # Rank features by absolute value × model feature importance
                 try:
                     fi = dict(zip(FEATURES, xgb_model.feature_importances_))
                     impact = {f: abs(feat_vals.get(f, 0)) * fi.get(f, 0) for f in FEATURES}
@@ -969,67 +1046,54 @@ with tab3:
                 except Exception:
                     top_feats = []
 
-                # ── Render result ─────────────────────────────────────────────
-                import streamlit.components.v1 as components
-
                 prob_bar = lambda p, col, lbl: (
                     f'<div style="margin:6px 0">'
-                    f'<div style="display:flex;justify-content:space-between;'
-                    f'font-size:0.8rem;margin-bottom:2px">'
+                    f'<div style="display:flex;justify-content:space-between;font-size:.8rem;margin-bottom:2px">'
                     f'<span>{lbl}</span><span>{p*100:.1f}%</span></div>'
                     f'<div style="background:#E5E7EB;border-radius:4px;height:10px">'
-                    f'<div style="background:{col};width:{p*100:.1f}%;height:10px;'
-                    f'border-radius:4px"></div></div></div>'
+                    f'<div style="background:{col};width:{p*100:.1f}%;height:10px;border-radius:4px"></div>'
+                    f'</div></div>'
                 )
 
+                feat_colors = {"is_rain":"#3B82F6","is_rush":"#EF4444","hour":"#F59E0B",
+                               "factor":"#8B5CF6","trip_count":"#06B6D4","route_count":"#10B981"}
                 feat_rows = ""
-                feat_colors = {
-                    "is_rain":"#3B82F6","is_rush":"#EF4444","hour":"#F59E0B",
-                    "factor":"#8B5CF6","trip_count":"#06B6D4","route_count":"#10B981",
-                }
                 for fn, fv in top_feats:
-                    disp = fn.replace("_"," ").title()
+                    disp  = fn.replace("_", " ").title()
                     raw_v = feat_vals.get(fn, 0)
-                    fc = feat_colors.get(fn, "#6B7280")
+                    fc    = feat_colors.get(fn, "#6B7280")
                     feat_rows += (
-                        f'<tr><td style="padding:4px 8px;font-size:0.8rem">{disp}</td>'
-                        f'<td style="padding:4px 8px;font-size:0.8rem;text-align:right">'
-                        f'<span style="background:{fc}22;color:{fc};padding:2px 6px;'
-                        f'border-radius:4px;font-weight:600">{raw_v:.3f}</span></td></tr>'
+                        f'<tr><td style="padding:4px 8px;font-size:.8rem">{disp}</td>'
+                        f'<td style="padding:4px 8px;font-size:.8rem;text-align:right">'
+                        f'<span style="background:{fc}22;color:{fc};padding:2px 6px;border-radius:4px;font-weight:600">'
+                        f'{raw_v:.3f}</span></td></tr>'
                     )
 
-                rush_tag = ""
-                if cls_hour in [7,8,9]:   rush_tag = "🔴 AM Rush"
-                elif cls_hour in [17,18,19]: rush_tag = "🔴 PM Rush"
+                rush_tag = "🔴 AM Rush" if cls_hour in [7,8,9] else ("🔴 PM Rush" if cls_hour in [17,18,19] else "")
                 rain_tag = "🌧️ Rain" if cls_rain else "☀️ Clear"
 
-                html = f"""
-<html><head><meta charset="utf-8">
+                html = f"""<html><head><meta charset="utf-8">
 <style>
   body{{margin:0;padding:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}}
-  .wrap{{background:#fff;border:1px solid #E2E8F0;border-radius:14px;padding:22px 24px;
-          box-shadow:0 2px 12px rgba(0,0,0,.07)}}
-  .badge{{display:inline-block;padding:6px 16px;border-radius:8px;
-           font-weight:800;font-size:1.1rem;margin-bottom:12px}}
+  .wrap{{background:#fff;border:1px solid #E2E8F0;border-radius:14px;padding:22px 24px;box-shadow:0 2px 12px rgba(0,0,0,.07)}}
+  .badge{{display:inline-block;padding:6px 16px;border-radius:8px;font-weight:800;font-size:1.1rem;margin-bottom:12px}}
   .grid{{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:14px}}
   .box{{background:#F8FAFC;border:1px solid #E2E8F0;border-radius:10px;padding:14px}}
-  .box h4{{margin:0 0 10px 0;font-size:0.85rem;color:#64748B;font-weight:700;
-            text-transform:uppercase;letter-spacing:.06em}}
+  .box h4{{margin:0 0 10px;font-size:.85rem;color:#64748B;font-weight:700;text-transform:uppercase;letter-spacing:.06em}}
   table{{width:100%;border-collapse:collapse}}
 </style></head><body>
 <div class="wrap">
   <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
     <div class="badge" style="background:{cls_bg};color:{cls_color}">{cls_label}</div>
-    <span style="font-size:0.85rem;color:#64748B">
-      {cls_stop} &nbsp;·&nbsp; {cls_hour:02d}:00 &nbsp;·&nbsp; {cls_dow} &nbsp;·&nbsp;
-      {datetime(2024,cls_month,1).strftime('%B')} &nbsp;·&nbsp; {rain_tag}
+    <span style="font-size:.85rem;color:#64748B">
+      {cls_stop} &nbsp;·&nbsp; {cls_hour:02d}:00 &nbsp;·&nbsp; {cls_dow}
+      &nbsp;·&nbsp; {datetime(2024,cls_month,1).strftime('%B')} &nbsp;·&nbsp; {rain_tag}
       {"&nbsp;·&nbsp;" + rush_tag if rush_tag else ""}
     </span>
   </div>
-  <p style="font-size:1.6rem;font-weight:800;color:{cls_color};margin:8px 0 0 0">
+  <p style="font-size:1.6rem;font-weight:800;color:{cls_color};margin:8px 0 0">
     {raw_delay:.1f} min <span style="font-size:1rem;font-weight:400">predicted delay</span>
   </p>
-
   <div class="grid">
     <div class="box">
       <h4>Class Probabilities</h4>
@@ -1042,415 +1106,98 @@ with tab3:
       <table>{feat_rows}</table>
     </div>
   </div>
-</div>
-</body></html>"""
+</div></body></html>"""
                 components.html(html, height=310, scrolling=False)
 
-                # ── Multi-stop batch classification ───────────────────────────
                 st.markdown("#### Compare Multiple Stops at This Time")
-                st.caption("Top 10 most-delayed vs top 10 best-performing stops right now")
-
-                sample_stops = stop_summary.nlargest(10,"avg_delay")["stop_name"].tolist() + \
-                               stop_summary.nsmallest(10,"avg_delay")["stop_name"].tolist()
+                sample_stops = (stop_summary.nlargest(10, "avg_delay")["stop_name"].tolist() +
+                                stop_summary.nsmallest(10, "avg_delay")["stop_name"].tolist())
                 batch_rows = []
                 for sn in sample_stops:
                     d = predict_delay(sn, cls_hour, cls_dow_int, cls_month, cls_rain)
                     lbl = "On-Time" if d < 3 else ("Minor Delay" if d < 8 else "Major Delay")
                     batch_rows.append({"Stop": sn, "Predicted Delay (min)": d, "Class": lbl})
-
                 bdf = pd.DataFrame(batch_rows).sort_values("Predicted Delay (min)", ascending=False)
 
                 fig_b, ax_b = plt.subplots(figsize=(10, 5))
-                colors_b = ["#EF4444" if c=="Major Delay" else
-                            "#F59E0B" if c=="Minor Delay" else "#10B981"
+                colors_b = ["#EF4444" if c == "Major Delay" else
+                            "#F59E0B" if c == "Minor Delay" else "#10B981"
                             for c in bdf["Class"]]
                 ax_b.barh(bdf["Stop"].str[:30], bdf["Predicted Delay (min)"],
                           color=colors_b, edgecolor="white")
-                ax_b.axvline(3, color="#F59E0B", ls="--", lw=1.2, label="Minor threshold (3 min)")
-                ax_b.axvline(8, color="#EF4444", ls="--", lw=1.2, label="Major threshold (8 min)")
+                ax_b.axvline(3, color="#F59E0B", ls="--", lw=1.2, label="Minor (3 min)")
+                ax_b.axvline(8, color="#EF4444", ls="--", lw=1.2, label="Major (8 min)")
                 ax_b.set_xlabel("Predicted Delay (min)")
                 ax_b.set_title(f"Delay Classification — {cls_hour:02d}:00 · {cls_dow} · "
                                f"{'Rain' if cls_rain else 'Clear'}")
-                ax_b.legend(fontsize=8)
-                ax_b.grid(axis="x", alpha=0.3)
-                plt.tight_layout()
-                st.pyplot(fig_b)
-                plt.close()
+                ax_b.legend(fontsize=8); ax_b.grid(axis="x", alpha=0.3)
+                plt.tight_layout(); st.pyplot(fig_b); plt.close()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 4 — ADMIN DASHBOARD
+# TAB 4 — ABOUT
 # ══════════════════════════════════════════════════════════════════════════════
 with tab4:
-    import streamlit.components.v1 as components
-
-    st.subheader("🛠️ Admin Dashboard — Network Overview")
-    st.markdown(
-        "System-wide analytics derived from the trained model and stop metadata. "
-        "No external data source required — all computed on-the-fly."
-    )
-    st.markdown("---")
-
-    # ── Admin password gate ───────────────────────────────────────────────────
-    _ADMIN_PW = "bmtc2024"
-    if "admin_unlocked" not in st.session_state:
-        st.session_state["admin_unlocked"] = False
-
-    if not st.session_state["admin_unlocked"]:
-        pw = st.text_input("🔒 Enter Admin Password", type="password", key="admin_pw")
-        if st.button("Unlock Dashboard", key="admin_unlock_btn"):
-            if pw == _ADMIN_PW:
-                st.session_state["admin_unlocked"] = True
-                st.rerun()
-            else:
-                st.error("Incorrect password.")
-        st.caption("Default password: `bmtc2024`  — change `_ADMIN_PW` in app.py")
-        st.stop()
-
-    # ── Controls ──────────────────────────────────────────────────────────────
-    adm_col1, adm_col2, adm_col3 = st.columns(3)
-    with adm_col1:
-        adm_hour  = st.slider("⏰ Analysis Hour", 0, 23, value=8, key="adm_h")
-    with adm_col2:
-        adm_dow   = st.selectbox("📅 Day", ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"],
-                                  key="adm_dow")
-        adm_dow_i = {"Mon":0,"Tue":1,"Wed":2,"Thu":3,"Fri":4,"Sat":5,"Sun":6}[adm_dow]
-    with adm_col3:
-        adm_rain  = int(st.toggle("🌧️ Rain scenario", key="adm_rain"))
-
-    adm_month = get_ist_now().month   # always current month
-
-    # ── Compute network-wide predictions ─────────────────────────────────────
-    @st.cache_data(ttl=300, show_spinner=False)
-    def _network_predictions(hour: int, dow: int, month: int, rain: int) -> pd.DataFrame:
-        rows = []
-        for _, row in stop_summary.iterrows():
-            sn = row["stop_name"]
-            d  = predict_delay(sn, hour, dow, month, rain)
-            lbl = "On-Time" if d < 3 else ("Minor" if d < 8 else "Major")
-            rows.append({
-                "stop_name"   : sn,
-                "delay_min"   : d,
-                "class"       : lbl,
-                "avg_delay"   : float(row["avg_delay"]),
-                "trip_count"  : int(row["trip_count"]),
-                "route_count" : int(row["route_count"]),
-            })
-        return pd.DataFrame(rows)
-
-    with st.spinner("Computing network predictions..."):
-        net = _network_predictions(adm_hour, adm_dow_i, adm_month, adm_rain)
-
-    n_total  = len(net)
-    n_ontime = (net["class"] == "On-Time").sum()
-    n_minor  = (net["class"] == "Minor").sum()
-    n_major  = (net["class"] == "Major").sum()
-    avg_net  = net["delay_min"].mean()
-    max_net  = net["delay_min"].max()
-
-    # ── KPI row ───────────────────────────────────────────────────────────────
-    kpi_html = f"""
-<html><head><meta charset="utf-8">
-<style>
-  body{{margin:0;padding:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}}
-  .row{{display:grid;grid-template-columns:repeat(5,1fr);gap:12px}}
-  .kpi{{background:#fff;border:1px solid #E2E8F0;border-radius:12px;
-         padding:16px 18px;box-shadow:0 1px 6px rgba(0,0,0,.05);text-align:center}}
-  .kpi .val{{font-size:1.9rem;font-weight:800;line-height:1}}
-  .kpi .lbl{{font-size:0.72rem;color:#64748B;margin-top:4px;font-weight:600;
-              text-transform:uppercase;letter-spacing:.05em}}
-</style></head><body>
-<div class="row">
-  <div class="kpi">
-    <div class="val" style="color:#1A3A5C">{n_total:,}</div>
-    <div class="lbl">Total Stops</div>
-  </div>
-  <div class="kpi">
-    <div class="val" style="color:#10B981">{n_ontime:,}</div>
-    <div class="lbl">✅ On-Time</div>
-  </div>
-  <div class="kpi">
-    <div class="val" style="color:#F59E0B">{n_minor:,}</div>
-    <div class="lbl">⚠️ Minor Delay</div>
-  </div>
-  <div class="kpi">
-    <div class="val" style="color:#EF4444">{n_major:,}</div>
-    <div class="lbl">🔴 Major Delay</div>
-  </div>
-  <div class="kpi">
-    <div class="val" style="color:#6366F1">{avg_net:.1f} min</div>
-    <div class="lbl">Avg Network Delay</div>
-  </div>
-</div>
-</body></html>"""
-    components.html(kpi_html, height=110)
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    # ── Row 1: Delay distribution + class pie ─────────────────────────────────
-    r1c1, r1c2 = st.columns(2)
-
-    with r1c1:
-        st.markdown("#### Delay Distribution")
-        fig1, ax1 = plt.subplots(figsize=(5, 3))
-        ax1.hist(net["delay_min"], bins=40, color="#3B82F6", edgecolor="white", alpha=0.85)
-        ax1.axvline(3, color="#F59E0B", ls="--", lw=1.5, label="Minor (3 min)")
-        ax1.axvline(8, color="#EF4444", ls="--", lw=1.5, label="Major (8 min)")
-        ax1.set_xlabel("Predicted Delay (min)")
-        ax1.set_ylabel("Number of Stops")
-        ax1.set_title(f"{adm_hour:02d}:00 · {adm_dow} · {'Rain' if adm_rain else 'Clear'}")
-        ax1.legend(fontsize=8)
-        ax1.grid(alpha=0.3)
-        plt.tight_layout()
-        st.pyplot(fig1); plt.close()
-
-    with r1c2:
-        st.markdown("#### Network Status Breakdown")
-        fig2, ax2 = plt.subplots(figsize=(4, 3))
-        sizes  = [n_ontime, n_minor, n_major]
-        labels = [f"On-Time\n{n_ontime}", f"Minor\n{n_minor}", f"Major\n{n_major}"]
-        colors = ["#10B981", "#F59E0B", "#EF4444"]
-        explode = [0.04, 0.04, 0.08]
-        wedges, texts, autotexts = ax2.pie(
-            sizes, labels=labels, colors=colors, explode=explode,
-            autopct="%1.1f%%", startangle=120,
-            textprops={"fontsize": 8}, pctdistance=0.78,
-        )
-        for at in autotexts:
-            at.set_fontsize(8); at.set_color("white"); at.set_fontweight("bold")
-        ax2.set_title("Status Distribution", fontsize=9)
-        plt.tight_layout()
-        st.pyplot(fig2); plt.close()
-
-    # ── Row 2: Worst / Best stops ─────────────────────────────────────────────
-    r2c1, r2c2 = st.columns(2)
-
-    with r2c1:
-        st.markdown("#### 🔴 Top 15 Worst Stops")
-        worst = net.nlargest(15, "delay_min")[["stop_name", "delay_min", "class"]]
-        fig3, ax3 = plt.subplots(figsize=(5, 4.5))
-        bar_colors = ["#EF4444" if c == "Major" else "#F59E0B" for c in worst["class"]]
-        ax3.barh(worst["stop_name"].str[:28], worst["delay_min"],
-                 color=bar_colors, edgecolor="white")
-        ax3.set_xlabel("Predicted Delay (min)")
-        ax3.set_title("Worst Stops — Current Scenario")
-        ax3.grid(axis="x", alpha=0.3)
-        plt.tight_layout()
-        st.pyplot(fig3); plt.close()
-
-    with r2c2:
-        st.markdown("#### ✅ Top 15 Best Stops")
-        best = net.nsmallest(15, "delay_min")[["stop_name", "delay_min", "class"]]
-        fig4, ax4 = plt.subplots(figsize=(5, 4.5))
-        ax4.barh(best["stop_name"].str[:28], best["delay_min"],
-                 color="#10B981", edgecolor="white")
-        ax4.set_xlabel("Predicted Delay (min)")
-        ax4.set_title("Best Stops — Current Scenario")
-        ax4.grid(axis="x", alpha=0.3)
-        plt.tight_layout()
-        st.pyplot(fig4); plt.close()
-
-    # ── Row 3: 24-hr heatmap by hour & class ──────────────────────────────────
-    st.markdown("#### ⏱️ Network-Wide Hourly Delay Heatmap")
-    st.caption("Average predicted delay per hour across all stops · current day/month/rain setting")
-
-    @st.cache_data(ttl=600, show_spinner=False)
-    def _hourly_heatmap(dow: int, month: int, rain: int) -> np.ndarray:
-        """Returns shape (n_stops, 24) matrix of predicted delays."""
-        stops_list = stop_summary["stop_name"].tolist()
-        mat = np.zeros((len(stops_list), 24))
-        for h in range(24):
-            for i, sn in enumerate(stops_list):
-                mat[i, h] = predict_delay(sn, h, dow, month, rain)
-        return mat, stops_list
-
-    with st.spinner("Building hourly heatmap (runs once per scenario)..."):
-        mat, stops_list = _hourly_heatmap(adm_dow_i, adm_month, adm_rain)
-
-    hourly_avg = mat.mean(axis=0)   # shape (24,)
-    hourly_pct_major = (mat >= 8).mean(axis=0) * 100  # % stops in major delay per hour
-
-    fig5, (ax5a, ax5b) = plt.subplots(2, 1, figsize=(10, 5), sharex=True)
-    ax5a.plot(range(24), hourly_avg, color="#3B82F6", lw=2.5, marker="o", markersize=4)
-    ax5a.axhline(3, color="#F59E0B", ls="--", lw=1.2)
-    ax5a.axhline(8, color="#EF4444", ls="--", lw=1.2)
-    ax5a.axvspan(7, 9,  alpha=0.10, color="red")
-    ax5a.axvspan(17, 19, alpha=0.10, color="orange")
-    ax5a.set_ylabel("Avg Delay (min)")
-    ax5a.set_title(f"Network Hourly Profile — {adm_dow} · "
-                   f"{'Rain' if adm_rain else 'Clear'}")
-    ax5a.grid(alpha=0.3)
-
-    ax5b.fill_between(range(24), hourly_pct_major, color="#EF4444", alpha=0.5)
-    ax5b.plot(range(24), hourly_pct_major, color="#EF4444", lw=1.5)
-    ax5b.set_ylabel("% Stops Major Delay")
-    ax5b.set_xlabel("Hour of Day")
-    ax5b.set_xticks(range(0, 24, 2))
-    ax5b.grid(alpha=0.3)
-
-    plt.tight_layout()
-    st.pyplot(fig5); plt.close()
-
-    # ── Row 4: Rain impact analysis ───────────────────────────────────────────
-    st.markdown("#### 🌧️ Rain Impact Analysis")
-    st.caption("Comparing dry vs rainy scenario for the selected hour across all stops")
-
-    @st.cache_data(ttl=600, show_spinner=False)
-    def _rain_delta(hour: int, dow: int, month: int) -> pd.DataFrame:
-        rows = []
-        for _, row in stop_summary.iterrows():
-            sn   = row["stop_name"]
-            d_dry  = predict_delay(sn, hour, dow, month, 0)
-            d_rain = predict_delay(sn, hour, dow, month, 1)
-            rows.append({"stop": sn, "dry": d_dry, "rain": d_rain,
-                         "delta": d_rain - d_dry,
-                         "trip_count": int(row["trip_count"])})
-        return pd.DataFrame(rows)
-
-    with st.spinner("Computing rain delta..."):
-        rain_df = _rain_delta(adm_hour, adm_dow_i, adm_month)
-
-    rc1, rc2 = st.columns(2)
-    with rc1:
-        avg_dry  = rain_df["dry"].mean()
-        avg_rain = rain_df["rain"].mean()
-        fig6, ax6 = plt.subplots(figsize=(5, 3))
-        ax6.bar(["☀️ Dry", "🌧️ Rain"], [avg_dry, avg_rain],
-                color=["#3B82F6", "#6366F1"], edgecolor="white", width=0.5)
-        ax6.set_ylabel("Avg Delay (min)")
-        ax6.set_title(f"Rain Effect · {adm_hour:02d}:00 · {adm_dow}")
-        for i, v in enumerate([avg_dry, avg_rain]):
-            ax6.text(i, v + 0.1, f"{v:.2f}", ha="center", fontsize=9, fontweight="bold")
-        ax6.grid(axis="y", alpha=0.3)
-        plt.tight_layout()
-        st.pyplot(fig6); plt.close()
-
-    with rc2:
-        top_rain_impact = rain_df.nlargest(10, "delta")[["stop", "delta"]]
-        fig7, ax7 = plt.subplots(figsize=(5, 3))
-        ax7.barh(top_rain_impact["stop"].str[:28], top_rain_impact["delta"],
-                 color="#6366F1", edgecolor="white")
-        ax7.set_xlabel("Extra Delay in Rain (min)")
-        ax7.set_title("Stops Most Affected by Rain")
-        ax7.grid(axis="x", alpha=0.3)
-        plt.tight_layout()
-        st.pyplot(fig7); plt.close()
-
-    # ── Row 5: Stop Audit Table ────────────────────────────────────────────────
-    st.markdown("#### 🔎 Full Stop Audit")
-    audit_search = st.text_input("Filter stops by name:", key="audit_search")
-    audit_df = net.copy()
-    audit_df.columns = ["Stop Name", "Predicted Delay (min)", "Severity Class",
-                        "Hist. Avg Delay", "Trip Count", "Route Count"]
-    if audit_search:
-        audit_df = audit_df[audit_df["Stop Name"].str.contains(
-            audit_search, case=False, na=False)]
-
-    # Colour-code the class column
-    def _highlight_class(val):
-        if val == "Major":   return "background-color:#FEE2E2;color:#991B1B;font-weight:700"
-        if val == "Minor":   return "background-color:#FEF3C7;color:#92400E;font-weight:700"
-        return "background-color:#D1FAE5;color:#065F46;font-weight:700"
-
-    styled = (
-        audit_df.sort_values("Predicted Delay (min)", ascending=False)
-        .reset_index(drop=True)
-        .style
-        .applymap(_highlight_class, subset=["Severity Class"])
-        .format({"Predicted Delay (min)": "{:.1f}", "Hist. Avg Delay": "{:.2f}"})
-    )
-    st.dataframe(styled, use_container_width=True, height=400)
-
-    csv_bytes = audit_df.to_csv(index=False).encode()
-    st.download_button(
-        "⬇️ Download Audit CSV",
-        data=csv_bytes,
-        file_name=f"bmtc_audit_{adm_dow}_{adm_hour:02d}h_"
-                  f"{'rain' if adm_rain else 'dry'}.csv",
-        mime="text/csv",
-        key="audit_dl",
-    )
-
-    # ── Row 6: Scenario Comparison ─────────────────────────────────────────────
-    st.markdown("#### 📊 Scenario Comparison (Rush Hour vs Off-Peak)")
-    sc1, sc2 = st.columns(2)
-    with sc1:
-        st.caption("AM Rush — 08:00 Monday, Rain")
-        rush_preds = [predict_delay(s, 8, 0, adm_month, 1)
-                      for s in stop_summary["stop_name"]]
-        st.metric("Avg Delay", f"{np.mean(rush_preds):.2f} min")
-        st.metric("% Major Delay Stops",
-                  f"{100*sum(d>=8 for d in rush_preds)/len(rush_preds):.1f}%")
-    with sc2:
-        st.caption("Off-Peak — 14:00 Wednesday, Clear")
-        offpeak_preds = [predict_delay(s, 14, 2, adm_month, 0)
-                         for s in stop_summary["stop_name"]]
-        st.metric("Avg Delay", f"{np.mean(offpeak_preds):.2f} min")
-        st.metric("% Major Delay Stops",
-                  f"{100*sum(d>=8 for d in offpeak_preds)/len(offpeak_preds):.1f}%")
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 5 — ABOUT
-# ══════════════════════════════════════════════════════════════════════════════
-with tab5:
     st.subheader("About This Project")
-
     n_stops   = metadata.get("n_stops", "~1,955")
     n_prophet = len(prophet_stops)
-
     st.markdown(f"""
-    **Project:** Real-Time Public Transport Delay Prediction — Bengaluru
+**Project:** Real-Time Public Transport Delay Prediction — Bengaluru
 
-    **Domain:** Machine Learning | Time-Series Forecasting | Regression | Classification
+**Domain:** Machine Learning | Time-Series Forecasting | Regression | Classification
 
-    **Dataset:** BMTC GTFS Aggregated Data (4,655 real Bengaluru bus stops
-    with trip counts, route counts, and GPS coordinates)
+**Dataset:** BMTC GTFS Aggregated Data (4,655 real Bengaluru bus stops
+with trip counts, route counts, and GPS coordinates)
 
-    **Team:** 2-Member Project · 300 Marks
+**Team:** 2-Member Project · 300 Marks
 
-    ---
+---
 
-    #### Model Architecture (Hybrid)
+#### Model Architecture (Hybrid)
 
-    | Model | Type | Scope | Purpose |
-    |---|---|---|---|
-    | **XGBoost** | ML Regression | All {n_stops:,} stops | Live delay prediction (primary) |
-    | **Delay Classifier** | Rule-based + ML | All stops | 3-class delay severity label |
-    | LSTM (Bi-directional) | Deep Learning | Busiest stop | Academic comparison |
-    | ARIMA | Statistical | Busiest stop | Time-series baseline |
-    | SARIMA | Statistical | Busiest stop | Seasonal time-series baseline |
-    | Prophet | Time-series | Top {n_prophet} high-delay stops | 24-hr forecast chart |
+| Model | Type | Scope | Purpose |
+|---|---|---|---|
+| **XGBoost** | ML Regression | All {n_stops:,} stops | Live delay prediction (primary) |
+| **Delay Classifier** | Rule-based + ML | All stops | 3-class delay severity label |
+| LSTM (Bi-directional) | Deep Learning | Busiest stop | Academic comparison |
+| ARIMA | Statistical | Busiest stop | Time-series baseline |
+| SARIMA | Statistical | Busiest stop | Seasonal baseline |
+| Prophet | Time-series | Top {n_prophet} high-delay stops | 24-hr forecast chart |
 
-    ---
+---
 
-    #### New Features (v2)
-    - 🧠 **Delay Classifier** — classifies each corridor prediction into On-Time / Minor Delay / Major Delay with probability breakdown and feature impact
-    - 🛠️ **Admin Dashboard** — network-level KPIs, worst/best stop heatmaps, delay distribution, hourly heatmap, rain impact analysis, batch stop audit
-    - 🌦️ **Live weather** — OpenWeatherMap API, auto-sets rain toggle every 10 min
-    - 🕐 **Current IST time default** — rounds to nearest 30-min slot
-    - 🗺️ **GTFS bus lookup** — proper stop→trip→route join on BMTC GTFS data
+#### New Features (v3)
+- 🔐 **Login & Registration** — SQLite-backed user accounts (email + hashed password)
+- ⭐ **Travel Favourites** — Save, name, and reuse frequent routes (persisted in DB)
+- 🕓 **Travel History** — Every search saved automatically, viewable per user
+- 🕐 **ETA Prediction** — Departure time + predicted delay = estimated arrival time
+- 🗺️ **Leaflet Map** — Interactive route map with colour-coded delay markers
+- 🌦️ **Live weather** — OpenWeatherMap API auto-sets rain toggle every 10 min
+- 🗺️ **GTFS bus lookup** — Stop→trip→route join on BMTC GTFS data
 
-    ---
+---
 
-    #### How Prediction Works
-    1. User types FROM and TO stop — fuzzy search finds the closest match
-    2. Travel date selected from calendar (past dates hidden)
-    3. Time selected from 30-min slots — defaults to current IST time
-    4. Rain status auto-detected from live weather API (overrideable)
-    5. **XGBoost** predicts delay (minutes) using 19 engineered features
-    6. **Delay Classifier** maps delay → severity class + confidence
-    7. Bus numbers looked up from BMTC GTFS join (stops→trips→routes)
-    8. If stop is in top {n_prophet} high-delay stops, **Prophet** adds 24-hr forecast
+#### How Prediction Works
+1. User logs in → searches FROM and TO stop
+2. XGBoost predicts delay (minutes) using 19 engineered features
+3. Delay Classifier maps delay → severity class + confidence
+4. ETA = departure time + predicted delay
+5. Bus numbers looked up from BMTC GTFS join
+6. Leaflet map shows colour-coded markers at both stops
+7. If stop is in top {n_prophet} high-delay stops, Prophet adds 24-hr forecast
+8. Search saved to user's travel history automatically
 
-    ---
+---
 
-    #### Tools & Libraries
-    Python · XGBoost · Prophet · Scikit-learn · TensorFlow/Keras ·
-    Pandas · NumPy · Matplotlib · Streamlit · OpenWeatherMap API · Google Colab
-    """)
+#### Tools & Libraries
+Python · XGBoost · Prophet · Scikit-learn · TensorFlow/Keras ·
+Pandas · NumPy · Matplotlib · Streamlit · SQLite · Leaflet.js ·
+OpenWeatherMap API · Google Colab
+""")
 
-# ── Footer ────────────────────────────────────────────────────────────────────
+# ── Footer ─────────────────────────────────────────────────────────────────────
 st.markdown("""
     <hr>
     <p style='text-align:center;color:gray;font-size:0.8em'>
-    BMTC Delay Prediction · Bengaluru · v2.0
+    BMTC Delay Prediction · Bengaluru · v3.0
     </p>
 """, unsafe_allow_html=True)
