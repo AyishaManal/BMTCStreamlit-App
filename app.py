@@ -59,17 +59,18 @@ firebase_config = dict(st.secrets["firebase"])
 firebase = pyrebase.initialize_app(firebase_config)
 auth = firebase.auth()
 
-# Initialize Firestore (server-side DB)
+# initialize (Server-side)
 if not firebase_admin._apps:
     
-# Fix newline issue explicitly
-     firebase_admin_config["private_key"] = firebase_admin_config["private_key"].replace("\\n", "\n")
+    firebase_admin_config = dict(st.secrets["firebase_admin"])
 
-     cred = credentials.Certificate(firebase_admin_config)
+    # Fix newline issue explicitly
+    firebase_admin_config["private_key"] = firebase_admin_config["private_key"].replace("\\n", "\n")
+
+    cred = credentials.Certificate(firebase_admin_config)
     firebase_admin.initialize_app(cred)
 
 db = firestore.client()
-
 # ══════════════════════════════════════════════════════════════════════════════
 # AUTH HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
