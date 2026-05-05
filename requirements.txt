@@ -7,7 +7,7 @@ scikit-learn
 joblib
 xgboost
 prophet
-beautifulsoup4s
+beautifulsoup4
 pyrebase4
 firebase-admin
 requests
