@@ -871,6 +871,7 @@ with tab1:
                          selected_label, src_delay, dst_delay, is_rain)
 
             # ── Save to Favourites ─────────────────────────────────────────────
+            st.write("User ID:", CUR_USER_ID)
             st.markdown("#### ⭐ Save This Route")
             fav_col1, fav_col2 = st.columns([3, 1])
             with fav_col1:
