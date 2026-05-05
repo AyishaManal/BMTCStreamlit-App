@@ -11,7 +11,6 @@ import joblib
 import json
 import os
 import re
-import sqlite3
 import hashlib
 import requests
 import streamlit.components.v1 as components
@@ -20,18 +19,15 @@ from datetime import date, datetime, timedelta
 import pytz
 import warnings
 warnings.filterwarnings("ignore")
+import pyrebase
+import firebase_admin
+from firebase_admin import credentials, firestore
 
-# ── Page config ───────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="BMTC Delay Predictor",
-    page_icon="🚌",
-    layout="centered",
-)
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 MODEL_DIR  = "models"
 OUTPUT_DIR = "outputs"
-DB_PATH    = "bmtc_users.db"   # SQLite file created automatically
+
 
 # ── OpenWeatherMap API key ────────────────────────────────────────────────────
 # ▶ HOW TO SET: Streamlit Cloud → App Settings → Secrets → paste:
@@ -49,140 +45,123 @@ except (KeyError, FileNotFoundError):
 # DATABASE SETUP
 # ══════════════════════════════════════════════════════════════════════════════
 
-def get_db():
-    """Return a thread-local SQLite connection."""
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+# ══════════════════════════════════════════════════════════════════════════════
+# FIREBASE SETUP
+# ══════════════════════════════════════════════════════════════════════════════
 
-def init_db():
-    conn = get_db()
-    c = conn.cursor()
+import streamlit as st
+import pyrebase
+import firebase_admin
+from firebase_admin import credentials, firestore
 
-    # Users table
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id       INTEGER PRIMARY KEY AUTOINCREMENT,
-            email    TEXT    UNIQUE NOT NULL,
-            password TEXT    NOT NULL,
-            name     TEXT    NOT NULL,
-            created  TEXT    DEFAULT (datetime('now'))
-        )
-    """)
+# Initialize Firebase Auth (client-side)
+firebase_config = dict(st.secrets["firebase"])
+firebase = pyrebase.initialize_app(firebase_config)
+auth = firebase.auth()
 
-    # Favourites table
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS favourites (
-            id        INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id   INTEGER NOT NULL,
-            label     TEXT    NOT NULL,
-            from_stop TEXT    NOT NULL,
-            to_stop   TEXT    NOT NULL,
-            added     TEXT    DEFAULT (datetime('now')),
-            FOREIGN KEY (user_id) REFERENCES users(id)
-        )
-    """)
+# Initialize Firestore (server-side DB)
+if not firebase_admin._apps:
+    cred = credentials.Certificate(dict(st.secrets["firebase_admin"]))
+    firebase_admin.initialize_app(cred)
 
-    # Travel history table
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS travel_history (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id    INTEGER NOT NULL,
-            from_stop  TEXT    NOT NULL,
-            to_stop    TEXT    NOT NULL,
-            travel_date TEXT   NOT NULL,
-            travel_time TEXT   NOT NULL,
-            src_delay  REAL,
-            dst_delay  REAL,
-            is_rain    INTEGER,
-            searched   TEXT    DEFAULT (datetime('now')),
-            FOREIGN KEY (user_id) REFERENCES users(id)
-        )
-    """)
+db = firestore.client()
 
-    conn.commit()
-    conn.close()
+# ══════════════════════════════════════════════════════════════════════════════
+# AUTH HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
 
-init_db()
-
-# ── Auth helpers ──────────────────────────────────────────────────────────────
-def hash_password(pw: str) -> str:
-    return hashlib.sha256(pw.encode()).hexdigest()
-
-def register_user(email: str, password: str, name: str) -> tuple[bool, str]:
+def register_user(email: str, password: str, name: str):
     try:
-        conn = get_db()
-        conn.execute(
-            "INSERT INTO users (email, password, name) VALUES (?, ?, ?)",
-            (email.lower().strip(), hash_password(password), name.strip())
-        )
-        conn.commit()
-        conn.close()
+        user = auth.create_user_with_email_and_password(email, password)
+
+        # Store user profile in Firestore
+        db.collection("users").document(user["localId"]).set({
+            "name": name,
+            "email": email
+        })
+
         return True, "Account created successfully!"
-    except sqlite3.IntegrityError:
-        return False, "An account with this email already exists."
+    except:
+        return False, "Signup failed. Email may already exist."
+
 
 def login_user(email: str, password: str):
-    """Returns user Row or None."""
-    conn = get_db()
-    row = conn.execute(
-        "SELECT * FROM users WHERE email=? AND password=?",
-        (email.lower().strip(), hash_password(password))
-    ).fetchone()
-    conn.close()
-    return row
+    try:
+        user = auth.sign_in_with_email_and_password(email, password)
 
-# ── Favourites helpers ────────────────────────────────────────────────────────
+        # Fetch user profile
+        doc = db.collection("users").document(user["localId"]).get()
+        data = doc.to_dict()
+
+        return {
+            "id": user["localId"],
+            "email": email,
+            "name": data.get("name", "User")
+        }
+
+    except:
+        return None
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FAVORITES (Firestore)
+# ══════════════════════════════════════════════════════════════════════════════
+
 def add_favourite(user_id, label, from_stop, to_stop):
-    conn = get_db()
-    conn.execute(
-        "INSERT INTO favourites (user_id, label, from_stop, to_stop) VALUES (?,?,?,?)",
-        (user_id, label, from_stop, to_stop)
-    )
-    conn.commit(); conn.close()
+    db.collection("favorites").add({
+        "user_id": user_id,
+        "label": label,
+        "from_stop": from_stop,
+        "to_stop": to_stop,
+        "added": firestore.SERVER_TIMESTAMP
+    })
+
 
 def get_favourites(user_id):
-    conn = get_db()
-    rows = conn.execute(
-        "SELECT * FROM favourites WHERE user_id=? ORDER BY added DESC",
-        (user_id,)
-    ).fetchall()
-    conn.close()
-    return rows
+    docs = db.collection("favorites").where("user_id", "==", user_id).stream()
+    return [doc.to_dict() | {"id": doc.id} for doc in docs]
+
 
 def delete_favourite(fav_id):
-    conn = get_db()
-    conn.execute("DELETE FROM favourites WHERE id=?", (fav_id,))
-    conn.commit(); conn.close()
+    db.collection("favorites").document(fav_id).delete()
 
-# ── History helpers ───────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# TRAVEL HISTORY (Firestore)
+# ══════════════════════════════════════════════════════════════════════════════
+
 def save_history(user_id, from_stop, to_stop, travel_date, travel_time,
                  src_delay, dst_delay, is_rain):
-    conn = get_db()
-    conn.execute("""
-        INSERT INTO travel_history
-          (user_id, from_stop, to_stop, travel_date, travel_time,
-           src_delay, dst_delay, is_rain)
-        VALUES (?,?,?,?,?,?,?,?)
-    """, (user_id, from_stop, to_stop, str(travel_date), travel_time,
-          src_delay, dst_delay, is_rain))
-    conn.commit(); conn.close()
+
+    db.collection("travel_history").add({
+        "user_id": user_id,
+        "from_stop": from_stop,
+        "to_stop": to_stop,
+        "travel_date": str(travel_date),
+        "travel_time": travel_time,
+        "src_delay": src_delay,
+        "dst_delay": dst_delay,
+        "is_rain": is_rain,
+        "searched": firestore.SERVER_TIMESTAMP
+    })
+
 
 def get_history(user_id, limit=30):
-    conn = get_db()
-    rows = conn.execute("""
-        SELECT * FROM travel_history
-        WHERE user_id=?
-        ORDER BY searched DESC LIMIT ?
-    """, (user_id, limit)).fetchall()
-    conn.close()
-    return rows
+    docs = (
+        db.collection("travel_history")
+        .where("user_id", "==", user_id)
+        .order_by("searched", direction=firestore.Query.DESCENDING)
+        .limit(limit)
+        .stream()
+    )
+
+    return [doc.to_dict() for doc in docs]
 
 # ══════════════════════════════════════════════════════════════════════════════
-# AUTH UI  (shown when not logged in)
+# AUTH UI
 # ══════════════════════════════════════════════════════════════════════════════
+
 if "user" not in st.session_state:
     st.session_state["user"] = None
+
 
 def show_auth():
     st.markdown("""
@@ -193,49 +172,61 @@ def show_auth():
 
     tab_login, tab_reg = st.tabs(["🔑 Login", "📝 Register"])
 
+    # ── LOGIN ────────────────────────────────────────────────────────────────
     with tab_login:
         st.subheader("Welcome back")
+
         email = st.text_input("Email", key="li_email")
         pw    = st.text_input("Password", type="password", key="li_pw")
-        if st.button("Login", type="primary", use_container_width=True, key="li_btn"):
+
+        if st.button("Login", type="primary", use_container_width=True):
             if not email or not pw:
                 st.error("Please fill in both fields.")
             else:
                 user = login_user(email, pw)
+
                 if user:
-                    st.session_state["user"] = dict(user)
+                    st.session_state["user"] = user
                     st.success(f"Welcome back, {user['name']}! 👋")
                     st.rerun()
                 else:
                     st.error("Invalid email or password.")
 
+    # ── REGISTER ─────────────────────────────────────────────────────────────
     with tab_reg:
         st.subheader("Create an account")
-        r_name  = st.text_input("Full Name", key="reg_name")
-        r_email = st.text_input("Email", key="reg_email")
-        r_pw    = st.text_input("Password (min 6 chars)", type="password", key="reg_pw")
-        r_pw2   = st.text_input("Confirm Password", type="password", key="reg_pw2")
-        if st.button("Create Account", type="primary", use_container_width=True, key="reg_btn"):
-            if not all([r_name, r_email, r_pw, r_pw2]):
+
+        name  = st.text_input("Full Name")
+        email = st.text_input("Email")
+        pw    = st.text_input("Password (min 6 chars)", type="password")
+        pw2   = st.text_input("Confirm Password", type="password")
+
+        if st.button("Create Account", type="primary", use_container_width=True):
+            if not all([name, email, pw, pw2]):
                 st.error("Please fill in all fields.")
-            elif len(r_pw) < 6:
+            elif len(pw) < 6:
                 st.error("Password must be at least 6 characters.")
-            elif r_pw != r_pw2:
+            elif pw != pw2:
                 st.error("Passwords do not match.")
             else:
-                ok, msg = register_user(r_email, r_pw, r_name)
+                ok, msg = register_user(email, pw, name)
                 if ok:
                     st.success(msg + " Please log in.")
                 else:
                     st.error(msg)
 
+# ══════════════════════════════════════════════════════════════════════════════
+# LOGIN CHECK
+# ══════════════════════════════════════════════════════════════════════════════
+
 if not st.session_state["user"]:
     show_auth()
     st.stop()
 
-# ── Shortcut for current user ─────────────────────────────────────────────────
+# ── CURRENT USER ──────────────────────────────────────────────────────────────
 CUR_USER    = st.session_state["user"]
 CUR_USER_ID = CUR_USER["id"]
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # WEATHER
