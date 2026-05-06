@@ -42,8 +42,17 @@ except (KeyError, FileNotFoundError):
     OWM_API_KEY = ""
 
 # ══════════════════════════════════════════════════════════════════════════════
+# DATABASE SETUP
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════════
 # FIREBASE SETUP
 # ══════════════════════════════════════════════════════════════════════════════
+
+import streamlit as st
+import pyrebase
+import firebase_admin
+from firebase_admin import credentials, firestore
 
 # Initialize Firebase Auth (client-side)
 firebase_config = dict(st.secrets["firebase"])
@@ -112,16 +121,12 @@ def add_favourite(user_id, label, from_stop, to_stop):
         })
         return True
     except Exception as e:
-        st.error(f"Firestore error: {e}")
+        st.session_state["fav_error"] = str(e)
         return False
 
 
 def get_favourites(user_id):
-    docs = (
-        db.collection("favorites")
-        .where(filter=firestore.FieldFilter("user_id", "==", user_id))
-        .stream()
-    )
+    docs = db.collection("favorites").where(filter=firestore.FieldFilter("user_id", "==", user_id)).stream()
     return [doc.to_dict() | {"id": doc.id} for doc in docs]
 
 
@@ -149,6 +154,7 @@ def save_history(user_id, from_stop, to_stop, travel_date, travel_time,
 
 
 def get_history(user_id, limit=30):
+    import pytz
     docs = (
         db.collection("travel_history")
         .where(filter=firestore.FieldFilter("user_id", "==", user_id))
@@ -660,7 +666,7 @@ with tab1:
             hist_data = []
             for h in history:
                 ts = h.get("searched")
-                searched_str = ts.strftime("%Y-%m-%d %H:%M") if hasattr(ts, "strftime") else str(ts)[:16] if ts else "—"
+                searched_str = ts.strftime("%Y-%m-%d %H:%M") if hasattr(ts, "strftime") else (str(ts)[:16] if ts else "—")
                 hist_data.append({
                     "Date"      : h.get("travel_date", "—"),
                     "Time"      : h.get("travel_time", "—"),
@@ -880,10 +886,14 @@ with tab1:
                     resolved_label = fav_label.strip() or f"{src_stop} → {dst_stop}"
                     ok = add_favourite(CUR_USER_ID, resolved_label, src_stop, dst_stop)
                     if ok:
-                        st.success(f"✅ '{resolved_label}' saved!")
-                        st.rerun()
+                        st.session_state["fav_saved_msg"] = f"✅ '{resolved_label}' saved to favourites!"
                     else:
-                        st.error("❌ Failed to save — see error above.")
+                        err = st.session_state.pop("fav_error", "Unknown Firestore error")
+                        st.error(f"❌ {err}")
+
+            if st.session_state.get("fav_saved_msg"):
+                st.success(st.session_state.pop("fav_saved_msg"))
+
 
             # ── Leaflet Map ────────────────────────────────────────────────────
             st.markdown("#### 🗺️ Route Map")
