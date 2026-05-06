@@ -95,7 +95,7 @@ def login_user(email: str, password: str):
         }
 
     except Exception as e:
-        st.error(f"Login failed: {e}")
+        st.session_state["login_error"] = str(e)
         return None
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -132,20 +132,17 @@ def delete_favourite(fav_id):
 def save_history(user_id, from_stop, to_stop, travel_date, travel_time,
                  src_delay, dst_delay, is_rain):
 
-    try:
-        _ts, _ref = db.collection("travel_history").add({
-            "user_id"    : user_id,
-            "from_stop"  : from_stop,
-            "to_stop"    : to_stop,
-            "travel_date": str(travel_date),
-            "travel_time": travel_time,
-            "src_delay"  : src_delay,
-            "dst_delay"  : dst_delay,
-            "is_rain"    : is_rain,
-            "searched"   : firestore.SERVER_TIMESTAMP,
-        })
-    except Exception as e:
-        pass  # history is non-critical, don't block the UI
+    db.collection("travel_history").add({
+        "user_id": user_id,
+        "from_stop": from_stop,
+        "to_stop": to_stop,
+        "travel_date": str(travel_date),
+        "travel_time": travel_time,
+        "src_delay": src_delay,
+        "dst_delay": dst_delay,
+        "is_rain": is_rain,
+        "searched": firestore.SERVER_TIMESTAMP
+    })
 
 
 def get_history(user_id, limit=30):
@@ -676,10 +673,6 @@ with tab1:
         else:
             st.info("No history yet. Your searches will appear here.")
 
-    # Show save confirmation if coming from a previous save action
-    if st.session_state.get("fav_saved_msg"):
-        st.success(st.session_state.pop("fav_saved_msg"))
-
     st.subheader("Enter Your Journey Details")
 
     # ── Pre-fill from favourites ───────────────────────────────────────────────
@@ -870,25 +863,9 @@ with tab1:
             save_history(CUR_USER_ID, src_stop, dst_stop, travel_date,
                          selected_label, src_delay, dst_delay, is_rain)
 
-            # ── Save to Favourites ─────────────────────────────────────────────
-            st.markdown("#### ⭐ Save This Route")
-            fav_col1, fav_col2 = st.columns([3, 1])
-            with fav_col1:
-                fav_label = st.text_input(
-                    "Label for this route (optional)",
-                    placeholder=f"{src_stop} → {dst_stop}",
-                    key="fav_label_input",
-                )
-            with fav_col2:
-                st.markdown("<br>", unsafe_allow_html=True)
-                if st.button("⭐ Save Favourite", key="save_fav_btn"):
-                    resolved_label = fav_label.strip() or f"{src_stop} → {dst_stop}"
-                    ok = add_favourite(CUR_USER_ID, resolved_label, src_stop, dst_stop)
-                    if ok:
-                        st.session_state["fav_saved_msg"] = f"✅ '{resolved_label}' saved to favourites!"
-                    else:
-                        err = st.session_state.pop("fav_error", "Unknown Firestore error")
-                        st.error(f"❌ {err}")
+            # ── Store route in session_state so Save Favourite works across reruns ──
+            st.session_state["last_src_stop"] = src_stop
+            st.session_state["last_dst_stop"] = dst_stop
 
             # ── Leaflet Map ────────────────────────────────────────────────────
             st.markdown("#### 🗺️ Route Map")
@@ -937,6 +914,31 @@ with tab1:
             ax.legend(fontsize=8); ax.grid(alpha=0.3); ax.set_xticks(range(0, 24, 2))
             plt.tight_layout()
             st.pyplot(fig); plt.close()
+
+    # ── Save to Favourites — outside Predict block so button click is caught ──
+    if st.session_state.get("last_src_stop") and st.session_state.get("last_dst_stop"):
+        _src = st.session_state["last_src_stop"]
+        _dst = st.session_state["last_dst_stop"]
+
+        st.markdown("---")
+        st.markdown("#### ⭐ Save This Route to Favourites")
+        fav_col1, fav_col2 = st.columns([3, 1])
+        with fav_col1:
+            fav_label = st.text_input(
+                "Give this route a label (optional)",
+                placeholder=f"{_src} → {_dst}",
+                key="fav_label_input",
+            )
+        with fav_col2:
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.button("⭐ Save Favourite", key="save_fav_btn", use_container_width=True):
+                resolved_label = fav_label.strip() or f"{_src} → {_dst}"
+                ok = add_favourite(CUR_USER_ID, resolved_label, _src, _dst)
+                if ok:
+                    st.success(f"✅ '{resolved_label}' saved to favourites!")
+                else:
+                    err = st.session_state.pop("fav_error", "Unknown error — check Firestore rules")
+                    st.error(f"❌ Failed to save: {err}")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 2 — MODEL RESULTS
@@ -1176,7 +1178,7 @@ with trip counts, route counts, and GPS coordinates)
 ---
 
 #### New Features (v3)
-- 🔐 **Login & Registration** — Firebase Auth + Firestore user accounts
+- 🔐 **Login & Registration** — SQLite-backed user accounts (email + hashed password)
 - ⭐ **Travel Favourites** — Save, name, and reuse frequent routes (persisted in DB)
 - 🕓 **Travel History** — Every search saved automatically, viewable per user
 - 🕐 **ETA Prediction** — Departure time + predicted delay = estimated arrival time
