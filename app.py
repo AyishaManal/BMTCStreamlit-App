@@ -42,17 +42,8 @@ except (KeyError, FileNotFoundError):
     OWM_API_KEY = ""
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DATABASE SETUP
-# ══════════════════════════════════════════════════════════════════════════════
-
-# ══════════════════════════════════════════════════════════════════════════════
 # FIREBASE SETUP
 # ══════════════════════════════════════════════════════════════════════════════
-
-import streamlit as st
-import pyrebase
-import firebase_admin
-from firebase_admin import credentials, firestore
 
 # Initialize Firebase Auth (client-side)
 firebase_config = dict(st.secrets["firebase"])
@@ -103,7 +94,8 @@ def login_user(email: str, password: str):
             "name": data.get("name", "User")
         }
 
-    except:
+    except Exception as e:
+        st.error(f"Login failed: {e}")
         return None
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -140,17 +132,20 @@ def delete_favourite(fav_id):
 def save_history(user_id, from_stop, to_stop, travel_date, travel_time,
                  src_delay, dst_delay, is_rain):
 
-    db.collection("travel_history").add({
-        "user_id": user_id,
-        "from_stop": from_stop,
-        "to_stop": to_stop,
-        "travel_date": str(travel_date),
-        "travel_time": travel_time,
-        "src_delay": src_delay,
-        "dst_delay": dst_delay,
-        "is_rain": is_rain,
-        "searched": firestore.SERVER_TIMESTAMP
-    })
+    try:
+        _ts, _ref = db.collection("travel_history").add({
+            "user_id"    : user_id,
+            "from_stop"  : from_stop,
+            "to_stop"    : to_stop,
+            "travel_date": str(travel_date),
+            "travel_time": travel_time,
+            "src_delay"  : src_delay,
+            "dst_delay"  : dst_delay,
+            "is_rain"    : is_rain,
+            "searched"   : firestore.SERVER_TIMESTAMP,
+        })
+    except Exception as e:
+        pass  # history is non-critical, don't block the UI
 
 
 def get_history(user_id, limit=30):
@@ -681,6 +676,10 @@ with tab1:
         else:
             st.info("No history yet. Your searches will appear here.")
 
+    # Show save confirmation if coming from a previous save action
+    if st.session_state.get("fav_saved_msg"):
+        st.success(st.session_state.pop("fav_saved_msg"))
+
     st.subheader("Enter Your Journey Details")
 
     # ── Pre-fill from favourites ───────────────────────────────────────────────
@@ -890,10 +889,6 @@ with tab1:
                     else:
                         err = st.session_state.pop("fav_error", "Unknown Firestore error")
                         st.error(f"❌ {err}")
-
-            if st.session_state.get("fav_saved_msg"):
-                st.success(st.session_state.pop("fav_saved_msg"))
-
 
             # ── Leaflet Map ────────────────────────────────────────────────────
             st.markdown("#### 🗺️ Route Map")
@@ -1181,7 +1176,7 @@ with trip counts, route counts, and GPS coordinates)
 ---
 
 #### New Features (v3)
-- 🔐 **Login & Registration** — SQLite-backed user accounts (email + hashed password)
+- 🔐 **Login & Registration** — Firebase Auth + Firestore user accounts
 - ⭐ **Travel Favourites** — Save, name, and reuse frequent routes (persisted in DB)
 - 🕓 **Travel History** — Every search saved automatically, viewable per user
 - 🕐 **ETA Prediction** — Departure time + predicted delay = estimated arrival time
