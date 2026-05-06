@@ -1004,24 +1004,50 @@ with tab3:
     )
     st.markdown("---")
 
+    # ── Stop Name ─────────────────────────────────────────────────────────────
     c1, c2 = st.columns(2)
     with c1:
         cls_stop_input = st.text_input("🔍 Stop Name", placeholder="e.g. Hebbal, Silk Board", key="cls_stop")
     with c2:
-        cls_hour = st.slider("⏰ Hour of Day", 0, 23, value=get_ist_now().hour, key="cls_hour")
-
-    c3, c4, c5 = st.columns(3)
-    with c3:
-        cls_dow = st.selectbox("📅 Day", ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"], key="cls_dow")
-        dow_map = {"Mon":0,"Tue":1,"Wed":2,"Thu":3,"Fri":4,"Sat":5,"Sun":6}
-        cls_dow_int = dow_map[cls_dow]
-    with c4:
-        cls_month = st.selectbox("📆 Month", list(range(1,13)),
-                                  format_func=lambda m: datetime(2024,m,1).strftime("%B"),
-                                  index=get_ist_now().month - 1, key="cls_month")
-    with c5:
         cls_rain = int(st.toggle("🌧️ Rain", key="cls_rain"))
 
+    # ── Date picker ───────────────────────────────────────────────────────────
+    st.markdown("📅 **Select Travel Date**")
+    cls_today       = date.today()
+    cls_travel_date = st.date_input(
+        " ",
+        value=cls_today,
+        min_value=cls_today,
+        max_value=cls_today + timedelta(days=30),
+        label_visibility="collapsed",
+        key="cls_date",
+    )
+    cls_dow_int = cls_travel_date.weekday()
+    cls_month   = cls_travel_date.month
+    cls_day_name = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"][cls_dow_int]
+    cls_dow      = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"][cls_dow_int]
+    st.caption(f"📆 {cls_travel_date.strftime('%d %B %Y')}  ({cls_day_name})")
+
+    # ── Time selector ─────────────────────────────────────────────────────────
+    st.markdown("⏰ **Time of Travel**")
+    cls_now_ist     = get_ist_now()
+    cls_default_idx = slot_index_for(cls_now_ist.hour, cls_now_ist.minute)
+    st.caption(f"🕐 Current Bengaluru time: **{cls_now_ist.strftime('%H:%M IST')}**")
+    cls_selected_label = st.selectbox(
+        " ",
+        options=TIME_LABELS,
+        index=cls_default_idx,
+        label_visibility="collapsed",
+        key="cls_time",
+    )
+    cls_hour, cls_minute = TIME_VALUES[TIME_LABELS.index(cls_selected_label)]
+
+    if   cls_hour in [7, 8, 9]:    st.caption("🔴 AM Rush Hour — expect higher delays")
+    elif cls_hour in [17, 18, 19]: st.caption("🔴 PM Rush Hour — expect higher delays")
+    elif 0 <= cls_hour <= 5:       st.caption("🌙 Late Night — minimal traffic expected")
+    else:                          st.caption("🟡 Normal Hours")
+
+    # ── Stop fuzzy match ──────────────────────────────────────────────────────
     cls_matches = find_stop(cls_stop_input) if cls_stop_input else []
     cls_stop = None
     if cls_matches:
@@ -1040,16 +1066,16 @@ with tab3:
                 raw_delay = float(np.clip(xgb_model.predict(X_cls)[0], 0, None))
 
                 if raw_delay < 3:
-                    cls_label = "✅ On-Time";    cls_color = "#065F46"; cls_bg = "#D1FAE5"
-                    p_ontime = max(0.0, min(1.0, 1.0 - raw_delay / 3.0))
-                    p_minor  = 1.0 - p_ontime;  p_major  = 0.0
+                    cls_label = "✅ On-Time";     cls_color = "#065F46"; cls_bg = "#D1FAE5"
+                    p_ontime  = max(0.0, min(1.0, 1.0 - raw_delay / 3.0))
+                    p_minor   = 1.0 - p_ontime;  p_major = 0.0
                 elif raw_delay < 8:
                     cls_label = "⚠️ Minor Delay"; cls_color = "#92400E"; cls_bg = "#FEF3C7"
-                    t = (raw_delay - 3) / 5.0
+                    t        = (raw_delay - 3) / 5.0
                     p_minor  = max(0.4, 1.0 - abs(t - 0.5))
                     p_ontime = max(0.0, 0.5 - t * 0.5)
                     p_major  = max(0.0, t * 0.5)
-                    total = p_ontime + p_minor + p_major
+                    total    = p_ontime + p_minor + p_major
                     p_ontime /= total; p_minor /= total; p_major /= total
                 else:
                     cls_label = "🔴 Major Delay"; cls_color = "#991B1B"; cls_bg = "#FEE2E2"
@@ -1058,8 +1084,8 @@ with tab3:
 
                 feat_vals = X_cls.iloc[0].to_dict()
                 try:
-                    fi = dict(zip(FEATURES, xgb_model.feature_importances_))
-                    impact = {f: abs(feat_vals.get(f, 0)) * fi.get(f, 0) for f in FEATURES}
+                    fi        = dict(zip(FEATURES, xgb_model.feature_importances_))
+                    impact    = {f: abs(feat_vals.get(f, 0)) * fi.get(f, 0) for f in FEATURES}
                     top_feats = sorted(impact.items(), key=lambda x: x[1], reverse=True)[:6]
                 except Exception:
                     top_feats = []
@@ -1073,8 +1099,11 @@ with tab3:
                     f'</div></div>'
                 )
 
-                feat_colors = {"is_rain":"#3B82F6","is_rush":"#EF4444","hour":"#F59E0B",
-                               "factor":"#8B5CF6","trip_count":"#06B6D4","route_count":"#10B981"}
+                feat_colors = {
+                    "is_rain"    : "#3B82F6", "is_rush"    : "#EF4444",
+                    "hour"       : "#F59E0B", "factor"     : "#8B5CF6",
+                    "trip_count" : "#06B6D4", "route_count": "#10B981",
+                }
                 feat_rows = ""
                 for fn, fv in top_feats:
                     disp  = fn.replace("_", " ").title()
@@ -1083,11 +1112,14 @@ with tab3:
                     feat_rows += (
                         f'<tr><td style="padding:4px 8px;font-size:.8rem">{disp}</td>'
                         f'<td style="padding:4px 8px;font-size:.8rem;text-align:right">'
-                        f'<span style="background:{fc}22;color:{fc};padding:2px 6px;border-radius:4px;font-weight:600">'
-                        f'{raw_v:.3f}</span></td></tr>'
+                        f'<span style="background:{fc}22;color:{fc};padding:2px 6px;'
+                        f'border-radius:4px;font-weight:600">{raw_v:.3f}</span></td></tr>'
                     )
 
-                rush_tag = "🔴 AM Rush" if cls_hour in [7,8,9] else ("🔴 PM Rush" if cls_hour in [17,18,19] else "")
+                rush_tag = (
+                    "🔴 AM Rush" if cls_hour in [7, 8, 9] else
+                    "🔴 PM Rush" if cls_hour in [17, 18, 19] else ""
+                )
                 rain_tag = "🌧️ Rain" if cls_rain else "☀️ Clear"
 
                 html = f"""<html><head><meta charset="utf-8">
@@ -1104,8 +1136,9 @@ with tab3:
   <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
     <div class="badge" style="background:{cls_bg};color:{cls_color}">{cls_label}</div>
     <span style="font-size:.85rem;color:#64748B">
-      {cls_stop} &nbsp;·&nbsp; {cls_hour:02d}:00 &nbsp;·&nbsp; {cls_dow}
-      &nbsp;·&nbsp; {datetime(2024,cls_month,1).strftime('%B')} &nbsp;·&nbsp; {rain_tag}
+      {cls_stop} &nbsp;·&nbsp; {cls_selected_label} &nbsp;·&nbsp; {cls_day_name}
+      &nbsp;·&nbsp; {cls_travel_date.strftime('%d %b %Y')}
+      &nbsp;·&nbsp; {rain_tag}
       {"&nbsp;·&nbsp;" + rush_tag if rush_tag else ""}
     </span>
   </div>
@@ -1128,28 +1161,38 @@ with tab3:
                 components.html(html, height=310, scrolling=False)
 
                 st.markdown("#### Compare Multiple Stops at This Time")
-                sample_stops = (stop_summary.nlargest(10, "avg_delay")["stop_name"].tolist() +
-                                stop_summary.nsmallest(10, "avg_delay")["stop_name"].tolist())
+                sample_stops = (
+                    stop_summary.nlargest(10, "avg_delay")["stop_name"].tolist() +
+                    stop_summary.nsmallest(10, "avg_delay")["stop_name"].tolist()
+                )
                 batch_rows = []
                 for sn in sample_stops:
-                    d = predict_delay(sn, cls_hour, cls_dow_int, cls_month, cls_rain)
+                    d   = predict_delay(sn, cls_hour, cls_dow_int, cls_month, cls_rain)
                     lbl = "On-Time" if d < 3 else ("Minor Delay" if d < 8 else "Major Delay")
                     batch_rows.append({"Stop": sn, "Predicted Delay (min)": d, "Class": lbl})
                 bdf = pd.DataFrame(batch_rows).sort_values("Predicted Delay (min)", ascending=False)
 
                 fig_b, ax_b = plt.subplots(figsize=(10, 5))
-                colors_b = ["#EF4444" if c == "Major Delay" else
-                            "#F59E0B" if c == "Minor Delay" else "#10B981"
-                            for c in bdf["Class"]]
+                colors_b = [
+                    "#EF4444" if c == "Major Delay" else
+                    "#F59E0B" if c == "Minor Delay" else "#10B981"
+                    for c in bdf["Class"]
+                ]
                 ax_b.barh(bdf["Stop"].str[:30], bdf["Predicted Delay (min)"],
                           color=colors_b, edgecolor="white")
                 ax_b.axvline(3, color="#F59E0B", ls="--", lw=1.2, label="Minor (3 min)")
                 ax_b.axvline(8, color="#EF4444", ls="--", lw=1.2, label="Major (8 min)")
                 ax_b.set_xlabel("Predicted Delay (min)")
-                ax_b.set_title(f"Delay Classification — {cls_hour:02d}:00 · {cls_dow} · "
-                               f"{'Rain' if cls_rain else 'Clear'}")
-                ax_b.legend(fontsize=8); ax_b.grid(axis="x", alpha=0.3)
-                plt.tight_layout(); st.pyplot(fig_b); plt.close()
+                ax_b.set_title(
+                    f"Delay Classification — {cls_selected_label} · {cls_day_name} · "
+                    f"{cls_travel_date.strftime('%d %b %Y')} · "
+                    f"{'Rain' if cls_rain else 'Clear'}"
+                )
+                ax_b.legend(fontsize=8)
+                ax_b.grid(axis="x", alpha=0.3)
+                plt.tight_layout()
+                st.pyplot(fig_b)
+                plt.close()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 4 — ABOUT
@@ -1166,7 +1209,6 @@ with tab4:
 **Dataset:** BMTC GTFS Aggregated Data (4,655 real Bengaluru bus stops
 with trip counts, route counts, and GPS coordinates)
 
-**Team:** 2-Member Project · 300 Marks
 
 ---
 
@@ -1216,6 +1258,6 @@ OpenWeatherMap API · Google Colab
 st.markdown("""
     <hr>
     <p style='text-align:center;color:gray;font-size:0.8em'>
-    BMTC Delay Prediction · Bengaluru · v3.0
+    BMTC Delay Prediction · Bengaluru ·
     </p>
 """, unsafe_allow_html=True)
