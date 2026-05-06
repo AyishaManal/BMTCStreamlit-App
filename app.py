@@ -94,8 +94,7 @@ def login_user(email: str, password: str):
             "name": data.get("name", "User")
         }
 
-    except Exception as e:
-        st.session_state["login_error"] = str(e)
+    except Exception:
         return None
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -630,8 +629,12 @@ tab1, tab2, tab3, tab4 = st.tabs([
 with tab1:
 
     # ── Sidebar-style Favourites panel ────────────────────────────────────────
+    # Cache in session_state — cleared on save/delete to force a fresh Firestore read
+    if "cached_favs" not in st.session_state:
+        st.session_state["cached_favs"] = get_favourites(CUR_USER_ID)
+    favs = st.session_state["cached_favs"]
+
     with st.expander("⭐ My Favourites", expanded=False):
-        favs = get_favourites(CUR_USER_ID)
         if favs:
             for fav in favs:
                 fc1, fc2, fc3 = st.columns([3, 2, 1])
@@ -642,10 +645,12 @@ with tab1:
                     if st.button("Use this route", key=f"use_fav_{fav['id']}"):
                         st.session_state["prefill_from"] = fav["from_stop"]
                         st.session_state["prefill_to"]   = fav["to_stop"]
+                        st.session_state.pop("cached_favs", None)
                         st.rerun()
                 with fc3:
                     if st.button("🗑️", key=f"del_fav_{fav['id']}"):
                         delete_favourite(fav["id"])
+                        st.session_state.pop("cached_favs", None)
                         st.rerun()
                 st.markdown("---")
         else:
@@ -863,9 +868,9 @@ with tab1:
             save_history(CUR_USER_ID, src_stop, dst_stop, travel_date,
                          selected_label, src_delay, dst_delay, is_rain)
 
-            # ── Store route in session_state so Save Favourite works across reruns ──
-            st.session_state["last_src_stop"] = src_stop
-            st.session_state["last_dst_stop"] = dst_stop
+            # Store stops in session_state — Save button lives outside this block
+            st.session_state["last_src"] = src_stop
+            st.session_state["last_dst"] = dst_stop
 
             # ── Leaflet Map ────────────────────────────────────────────────────
             st.markdown("#### 🗺️ Route Map")
@@ -915,30 +920,31 @@ with tab1:
             plt.tight_layout()
             st.pyplot(fig); plt.close()
 
-    # ── Save to Favourites — outside Predict block so button click is caught ──
-    if st.session_state.get("last_src_stop") and st.session_state.get("last_dst_stop"):
-        _src = st.session_state["last_src_stop"]
-        _dst = st.session_state["last_dst_stop"]
-
+    # ── Save Favourite UI — outside predict block so button click is always caught
+    if st.session_state.get("last_src") and st.session_state.get("last_dst"):
+        _src = st.session_state["last_src"]
+        _dst = st.session_state["last_dst"]
         st.markdown("---")
         st.markdown("#### ⭐ Save This Route to Favourites")
-        fav_col1, fav_col2 = st.columns([3, 1])
-        with fav_col1:
+        _c1, _c2 = st.columns([3, 1])
+        with _c1:
             fav_label = st.text_input(
                 "Give this route a label (optional)",
                 placeholder=f"{_src} → {_dst}",
                 key="fav_label_input",
             )
-        with fav_col2:
+        with _c2:
             st.markdown("<br>", unsafe_allow_html=True)
             if st.button("⭐ Save Favourite", key="save_fav_btn", use_container_width=True):
                 resolved_label = fav_label.strip() or f"{_src} → {_dst}"
                 ok = add_favourite(CUR_USER_ID, resolved_label, _src, _dst)
                 if ok:
-                    st.success(f"✅ '{resolved_label}' saved to favourites!")
+                    st.session_state.pop("cached_favs", None)  # force fresh read
+                    st.toast(f"⭐ '{resolved_label}' saved!", icon="✅")
+                    st.rerun()
                 else:
-                    err = st.session_state.pop("fav_error", "Unknown error — check Firestore rules")
-                    st.error(f"❌ Failed to save: {err}")
+                    err = st.session_state.pop("fav_error", "Unknown Firestore error")
+                    st.error(f"❌ {err}")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 2 — MODEL RESULTS
