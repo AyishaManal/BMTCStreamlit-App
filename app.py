@@ -23,6 +23,7 @@ import pyrebase
 import firebase_admin
 from firebase_admin import credentials, firestore
 
+
 # ── Paths ─────────────────────────────────────────────────────────────────────
 MODEL_DIR  = "models"
 OUTPUT_DIR = "outputs"
@@ -102,7 +103,7 @@ def login_user(email: str, password: str):
 
 def add_favourite(user_id, label, from_stop, to_stop):
     try:
-        _ts, doc_ref = db.collection("favorites").add({
+        _ts, _ref = db.collection("favorites").add({
             "user_id"  : user_id,
             "label"    : label,
             "from_stop": from_stop,
@@ -116,7 +117,11 @@ def add_favourite(user_id, label, from_stop, to_stop):
 
 
 def get_favourites(user_id):
-    docs = db.collection("favorites").where(filter=firestore.FieldFilter("user_id", "==", user_id)).stream()
+    docs = (
+        db.collection("favorites")
+        .where(filter=firestore.FieldFilter("user_id", "==", user_id))
+        .stream()
+    )
     return [doc.to_dict() | {"id": doc.id} for doc in docs]
 
 
@@ -144,15 +149,18 @@ def save_history(user_id, from_stop, to_stop, travel_date, travel_time,
 
 
 def get_history(user_id, limit=30):
-    docs = db.collection("travel_history") \
-        .where(filter=firestore.FieldFilter("user_id", "==", user_id)) \
+    docs = (
+        db.collection("travel_history")
+        .where(filter=firestore.FieldFilter("user_id", "==", user_id))
         .stream()
-
+    )
     data = [doc.to_dict() for doc in docs]
-
-    # Sort manually
-    data = sorted(data, key=lambda x: x.get("searched", ""), reverse=True)
-
+    # SERVER_TIMESTAMP returns a DatetimeWithNanoseconds — sort safely
+    data = sorted(
+        data,
+        key=lambda x: x.get("searched") or datetime.min.replace(tzinfo=pytz.utc),
+        reverse=True,
+    )
     return data[:limit]
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -652,16 +660,22 @@ with tab1:
         if history:
             hist_data = []
             for h in history:
-                status_src = get_status(h["src_delay"])[0] if h["src_delay"] else "—"
+                # searched is a Firestore DatetimeWithNanoseconds, format safely
+                searched_raw = h.get("searched")
+                if searched_raw and hasattr(searched_raw, "strftime"):
+                    searched_str = searched_raw.strftime("%Y-%m-%d %H:%M")
+                else:
+                    searched_str = str(searched_raw)[:16] if searched_raw else "—"
+
                 hist_data.append({
-                    "Date"      : h["travel_date"],
-                    "Time"      : h["travel_time"],
-                    "From"      : h["from_stop"],
-                    "To"        : h["to_stop"],
-                    "From Delay": f"{h['src_delay']} min" if h["src_delay"] else "—",
-                    "To Delay"  : f"{h['dst_delay']} min" if h["dst_delay"] else "—",
-                    "Rain"      : "🌧️" if h["is_rain"] else "☀️",
-                    "Searched": h["searched"].strftime("%Y-%m-%d %H:%M") if h.get("searched") else "—",
+                    "Date"      : h.get("travel_date", "—"),
+                    "Time"      : h.get("travel_time", "—"),
+                    "From"      : h.get("from_stop", "—"),
+                    "To"        : h.get("to_stop", "—"),
+                    "From Delay": f"{h['src_delay']} min" if h.get("src_delay") is not None else "—",
+                    "To Delay"  : f"{h['dst_delay']} min" if h.get("dst_delay") is not None else "—",
+                    "Rain"      : "🌧️" if h.get("is_rain") else "☀️",
+                    "Searched"  : searched_str,
                 })
             st.dataframe(pd.DataFrame(hist_data), use_container_width=True, height=240)
         else:
@@ -875,7 +889,7 @@ with tab1:
                         st.success(f"✅ '{resolved_label}' saved to favourites!")
                         st.rerun()
                     else:
-                        st.error("❌ Failed to save favourite — check Firestore rules.")
+                        st.error("❌ Failed to save — check Firestore rules in Firebase Console.")
 
             # ── Leaflet Map ────────────────────────────────────────────────────
             st.markdown("#### 🗺️ Route Map")
