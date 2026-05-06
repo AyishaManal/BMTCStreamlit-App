@@ -112,7 +112,7 @@ def add_favourite(user_id, label, from_stop, to_stop):
         })
         return True
     except Exception as e:
-        st.error(f"Error saving favourite: {e}")
+        st.error(f"Firestore error: {e}")
         return False
 
 
@@ -155,7 +155,6 @@ def get_history(user_id, limit=30):
         .stream()
     )
     data = [doc.to_dict() for doc in docs]
-    # SERVER_TIMESTAMP returns a DatetimeWithNanoseconds — sort safely
     data = sorted(
         data,
         key=lambda x: x.get("searched") or datetime.min.replace(tzinfo=pytz.utc),
@@ -660,13 +659,8 @@ with tab1:
         if history:
             hist_data = []
             for h in history:
-                # searched is a Firestore DatetimeWithNanoseconds, format safely
-                searched_raw = h.get("searched")
-                if searched_raw and hasattr(searched_raw, "strftime"):
-                    searched_str = searched_raw.strftime("%Y-%m-%d %H:%M")
-                else:
-                    searched_str = str(searched_raw)[:16] if searched_raw else "—"
-
+                ts = h.get("searched")
+                searched_str = ts.strftime("%Y-%m-%d %H:%M") if hasattr(ts, "strftime") else str(ts)[:16] if ts else "—"
                 hist_data.append({
                     "Date"      : h.get("travel_date", "—"),
                     "Time"      : h.get("travel_time", "—"),
@@ -886,10 +880,10 @@ with tab1:
                     resolved_label = fav_label.strip() or f"{src_stop} → {dst_stop}"
                     ok = add_favourite(CUR_USER_ID, resolved_label, src_stop, dst_stop)
                     if ok:
-                        st.success(f"✅ '{resolved_label}' saved to favourites!")
+                        st.success(f"✅ '{resolved_label}' saved!")
                         st.rerun()
                     else:
-                        st.error("❌ Failed to save — check Firestore rules in Firebase Console.")
+                        st.error("❌ Failed to save — see error above.")
 
             # ── Leaflet Map ────────────────────────────────────────────────────
             st.markdown("#### 🗺️ Route Map")
