@@ -124,6 +124,22 @@ def get_favourites(user_id):
 def delete_favourite(fav_id):
     db.collection("favorites").document(fav_id).delete()
 
+# ── Feedback helper ───────────────────────────────────────────────────────────
+def save_feedback(user_id, user_name, rating, category, message):
+    try:
+        _ts, _ref = db.collection("feedback").add({
+            "user_id"  : user_id,
+            "user_name": user_name,
+            "rating"   : rating,
+            "category" : category,
+            "message"  : message,
+            "submitted": firestore.SERVER_TIMESTAMP,
+        })
+        return True
+    except Exception as e:
+        st.session_state["feedback_error"] = str(e)
+        return False
+    
 # ══════════════════════════════════════════════════════════════════════════════
 # TRAVEL HISTORY (Firestore)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -616,11 +632,12 @@ with col_h2:
 
 st.markdown("<hr style='margin-top:0'>", unsafe_allow_html=True)
 
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "🔍 Predict Journey",
     "📊 Model Results",
     "🧠 Delay Classifier",
     "ℹ️ About Project",
+    "💬 Feedback",
 ])
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1253,7 +1270,87 @@ Python · XGBoost · Prophet · Scikit-learn · TensorFlow/Keras ·
 Pandas · NumPy · Matplotlib · Streamlit · SQLite · Leaflet.js ·
 OpenWeatherMap API · Google Colab
 """)
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 5 — FEEDBACK
+# ══════════════════════════════════════════════════════════════════════════════
+with tab5:
+    st.subheader("💬 Share Your Feedback")
+    st.markdown(
+        "Help us improve the BMTC Delay Predictor. "
+        "Your feedback is saved and reviewed by the team."
+    )
+    st.markdown("---")
 
+    # ── Star rating ───────────────────────────────────────────────────────────
+    st.markdown("#### ⭐ Rate Your Experience")
+    rating = st.select_slider(
+        " ",
+        options=["⭐ 1 — Poor", "⭐⭐ 2 — Fair", "⭐⭐⭐ 3 — Good",
+                 "⭐⭐⭐⭐ 4 — Very Good", "⭐⭐⭐⭐⭐ 5 — Excellent"],
+        value="⭐⭐⭐ 3 — Good",
+        label_visibility="collapsed",
+        key="fb_rating",
+    )
+
+    # ── Category ──────────────────────────────────────────────────────────────
+    st.markdown("#### 📂 Feedback Category")
+    category = st.selectbox(
+        " ",
+        options=[
+            "Prediction Accuracy",
+            "App Speed & Performance",
+            "Map & Visualisation",
+            "Login & Account Features",
+            "Favourites & Travel History",
+            "Bus Number Lookup",
+            "UI / User Experience",
+            "Feature Request",
+            "Bug Report",
+            "Other",
+        ],
+        label_visibility="collapsed",
+        key="fb_category",
+    )
+
+    # ── Message ───────────────────────────────────────────────────────────────
+    st.markdown("#### 📝 Your Message")
+    message = st.text_area(
+        " ",
+        placeholder="Tell us what you think — what worked well, what could be better, or any feature you'd like to see...",
+        height=150,
+        label_visibility="collapsed",
+        key="fb_message",
+    )
+
+    # ── Submit ────────────────────────────────────────────────────────────────
+    if st.button("📨 Submit Feedback", type="primary",
+                 use_container_width=True, key="fb_submit"):
+        if not message.strip():
+            st.warning("⚠️ Please write a message before submitting.")
+        else:
+            ok = save_feedback(
+                CUR_USER_ID,
+                CUR_USER["name"],
+                rating,
+                category,
+                message.strip(),
+            )
+            if ok:
+                st.success(
+                    f"✅ Thank you, {CUR_USER['name']}! "
+                    "Your feedback has been submitted successfully."
+                )
+                st.balloons()
+            else:
+                err = st.session_state.pop("feedback_error", "Unknown error")
+                st.error(f"❌ Failed to submit: {err}")
+
+    st.markdown("---")
+    st.caption(
+        "📌 Feedback is linked to your account and stored securely in Firebase. "
+        "We do not share your data with third parties."
+    )
+    
 # ── Footer ─────────────────────────────────────────────────────────────────────
 st.markdown("""
     <hr>
