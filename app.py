@@ -390,6 +390,98 @@ def load_gtfs_coords():
             pass
     return coords
 
+@st.cache_resource(show_spinner=False)
+def load_stop_timetable():
+    """Returns dict: stop_name_lower → list of (route_short_name, arrival_time_str)
+       arrival_time_str is HH:MM (24-hr), handles GTFS times > 23:59 (e.g. 25:30)."""
+    required = ["stops.txt", "stop_times.txt", "trips.txt", "routes.txt"]
+    paths    = {f: os.path.join(GTFS_DIR, f) for f in required}
+    if not all(os.path.exists(p) for p in paths.values()):
+        return {}
+
+    stops  = pd.read_csv(paths["stops.txt"],
+                         usecols=["stop_id", "stop_name"], dtype=str).dropna()
+    trips  = pd.read_csv(paths["trips.txt"],
+                         usecols=["trip_id", "route_id"], dtype=str).dropna()
+    routes = pd.read_csv(paths["routes.txt"],
+                         usecols=["route_id", "route_short_name"], dtype=str).dropna()
+    stop_times = pd.read_csv(paths["stop_times.txt"],
+                             usecols=["trip_id", "stop_id", "arrival_time"],
+                             dtype=str).dropna()
+
+    # Relational join
+    merged = (stop_times
+              .merge(trips,  on="trip_id")
+              .merge(routes, on="route_id")
+              .merge(stops,  on="stop_id"))
+
+    merged["stop_name_lower"] = merged["stop_name"].str.lower().str.strip()
+
+    timetable = {}
+    for _, row in merged[["stop_name_lower", "route_short_name", "arrival_time"]].iterrows():
+        key = row["stop_name_lower"]
+        timetable.setdefault(key, []).append(
+            (row["route_short_name"], row["arrival_time"])
+        )
+    return timetable
+
+
+def _parse_gtfs_time(time_str):
+    """Parse GTFS arrival_time (HH:MM:SS, may exceed 23:59) → total minutes from midnight."""
+    try:
+        parts = time_str.strip().split(":")
+        return int(parts[0]) * 60 + int(parts[1])
+    except Exception:
+        return -1
+
+
+def _fmt_gtfs_time(time_str):
+    """Format GTFS HH:MM:SS → display string HH:MM (wraps >23h back to next day)."""
+    try:
+        parts  = time_str.strip().split(":")
+        h, m   = int(parts[0]), int(parts[1])
+        h_disp = h % 24          # wrap GTFS times like 25:30 → 01:30
+        return f"{h_disp:02d}:{m:02d}"
+    except Exception:
+        return time_str[:5]
+
+
+def get_upcoming_buses(stop_name, selected_hour, selected_minute, window_min=90):
+    """Return list of (route_short_name, display_time) arriving within window_min
+       minutes of selected_hour:selected_minute at stop_name."""
+    timetable = load_stop_timetable()
+    if not timetable:
+        return []
+
+    key = _best_gtfs_match(stop_name.lower().strip(), timetable)
+    if not key:
+        return []
+
+    selected_total = selected_hour * 60 + selected_minute
+    upcoming = []
+
+    for route, arr_time in timetable[key]:
+        arr_total = _parse_gtfs_time(arr_time)
+        if arr_total < 0:
+            continue
+        # Show buses arriving from now up to window_min minutes ahead
+        if selected_total <= arr_total <= selected_total + window_min:
+            upcoming.append((route, _fmt_gtfs_time(arr_time), arr_total))
+
+    # Deduplicate: keep earliest arrival per route
+    seen   = {}
+    for route, disp, total in upcoming:
+        if route not in seen or total < seen[route][1]:
+            seen[route] = (disp, total)
+
+    # Sort by arrival time
+    result = sorted(
+        [(route, disp) for route, (disp, _) in seen.items()],
+        key=lambda x: x[1]
+    )
+    return result[:15]   # cap at 15 rows
+
+
 def _best_gtfs_match(query, lookup):
     q = query.lower().strip()
     if q in lookup: return q
@@ -880,6 +972,84 @@ with tab1:
   <div class="tip" style="background:{tip_bg}">{tip_icon} {tip_text}</div>
 </div></body></html>"""
             components.html(card_html, height=450, scrolling=False)
+
+            # ── Upcoming Bus Timetable ────────────────────────────────────────
+            st.markdown("#### 🕐 Upcoming Buses at Your Stop")
+            st.caption(
+                f"Buses arriving at **{src_stop}** within 90 minutes of "
+                f"**{selected_label}** (scheduled times from BMTC GTFS)"
+            )
+            with st.spinner("Loading timetable..."):
+                upcoming_buses = get_upcoming_buses(src_stop, hour, minute, window_min=90)
+
+            if upcoming_buses:
+                # Build colour-coded HTML table
+                rows_html = ""
+                for i, (route, arr_time) in enumerate(upcoming_buses):
+                    # Colour row by how soon the bus arrives
+                    try:
+                        arr_h, arr_m = map(int, arr_time.split(":"))
+                        arr_total    = arr_h * 60 + arr_m
+                        sel_total    = hour * 60 + minute
+                        diff_min     = arr_total - sel_total
+                    except Exception:
+                        diff_min = 99
+
+                    if diff_min <= 15:
+                        row_bg   = "#FEF3C7"
+                        time_col = "#92400E"
+                        badge    = f'<span style="font-size:.7rem;background:#F59E0B;color:#fff;padding:1px 6px;border-radius:4px;margin-left:6px">in {diff_min} min</span>'
+                    elif diff_min <= 30:
+                        row_bg   = "#F0FDF4"
+                        time_col = "#065F46"
+                        badge    = f'<span style="font-size:.7rem;background:#22C55E;color:#fff;padding:1px 6px;border-radius:4px;margin-left:6px">in {diff_min} min</span>'
+                    else:
+                        row_bg   = "#F8FAFC"
+                        time_col = "#1E3A5F"
+                        badge    = f'<span style="font-size:.7rem;color:#94A3B8;margin-left:6px">in {diff_min} min</span>'
+
+                    rows_html += f"""
+                    <tr style="background:{row_bg}">
+                      <td style="padding:8px 14px;font-weight:700;color:#1A3A5C;font-size:.9rem">{route}</td>
+                      <td style="padding:8px 14px;font-weight:800;color:{time_col};font-size:.95rem">
+                        {arr_time}{badge}
+                      </td>
+                    </tr>"""
+
+                timetable_html = f"""
+<html><head><meta charset="utf-8">
+<style>
+  body{{margin:0;padding:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}}
+  table{{width:100%;border-collapse:collapse;border-radius:10px;overflow:hidden;
+         border:1px solid #E2E8F0;box-shadow:0 1px 6px rgba(0,0,0,.06)}}
+  thead tr{{background:#1A3A5C}}
+  thead td{{padding:9px 14px;color:#fff;font-weight:700;font-size:.8rem;
+             text-transform:uppercase;letter-spacing:.05em}}
+  tbody tr:hover{{filter:brightness(0.97)}}
+</style></head><body>
+<table>
+  <thead><tr>
+    <td>Bus Number</td>
+    <td>Arrives At · {src_stop[:30]}</td>
+  </tr></thead>
+  <tbody>{rows_html}</tbody>
+</table>
+<p style="margin:6px 0 0;font-size:.72rem;color:#94A3B8">
+  🟡 within 15 min &nbsp;·&nbsp; 🟢 within 30 min &nbsp;·&nbsp;
+  Scheduled times only — actual arrival may vary by predicted delay above.
+</p>
+</body></html>"""
+                components.html(timetable_html,
+                                height=min(80 + len(upcoming_buses) * 42, 560),
+                                scrolling=True)
+            else:
+                st.info(
+                    f"No scheduled buses found at **{src_stop}** between "
+                    f"**{selected_label}** and "
+                    f"**{_fmt_gtfs_time(f'{(hour*60+minute+90)//60:02d}:{(hour*60+minute+90)%60:02d}:00')}**. "
+                    "This may mean the GTFS file does not cover this stop or "
+                    "no buses are scheduled in this window."
+                )
 
             # ── Save to history ────────────────────────────────────────────────
             save_history(CUR_USER_ID, src_stop, dst_stop, travel_date,
